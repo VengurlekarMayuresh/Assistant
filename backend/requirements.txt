@@ -1,0 +1,33 @@
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# ─── MongoDB (replaces PostgreSQL + SQLAlchemy) ────────────────────────────
+motor>=3.3.0
+pymongo>=4.6.0
+
+# ─── Qdrant Vector DB ──────────────────────────────────────────────────────
+qdrant-client>=1.9.0
+
+# ─── Neo4j Graph DB ────────────────────────────────────────────────────────
+neo4j>=5.15.0
+
+# ─── Embeddings (local, no API cost) ───────────────────────────────────────
+sentence-transformers>=3.0.0
+
+# ─── LangChain / LangGraph Agent Framework ────────────────────────────────
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-openai>=0.0.2
+langchain-google-genai>=1.0.0
+langgraph>=0.0.15
+
+# ─── GitHub & HTTP ────────────────────────────────────────────────────────
+pygithub>=1.59
+httpx>=0.24.0
+
+# ─── WebSockets & Misc ────────────────────────────────────────────────────
+websockets>=11.0.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.6

@@ -1,0 +1,84 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-dark-950 text-dark-100 font-sans antialiased selection:bg-brand-500/30 selection:text-brand-200 overflow-x-hidden;
+    background-image: 
+      radial-gradient(at 0% 0%, rgba(83, 86, 250, 0.05) 0px, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(117, 124, 255, 0.03) 0px, transparent 50%),
+      radial-gradient(at 50% 50%, rgba(15, 23, 42, 0.2) 0px, transparent 100%);
+    background-attachment: fixed;
+  }
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-dark-950;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-dark-800 rounded-full hover:bg-dark-700 transition-colors;
+}
+
+/* Custom Animations */
+@keyframes pulseGlow {
+  0%, 100% {
+    opacity: 0.15;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(1.05);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 8s infinite ease-in-out;
+}
+
+/* Glassmorphism helpers */
+.glass-panel {
+  @apply bg-dark-900/60 border border-dark-800/80 backdrop-blur-md;
+}
+
+.glass-panel-hover {
+  @apply hover:bg-dark-900/80 hover:border-dark-700/60 transition-all duration-300;
+}
+
+.text-gradient {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-brand-300 via-brand-500 to-indigo-400;
+}
+
+/* React Flow customizations */
+.react-flow__node {
+  @apply rounded-xl border border-dark-800 bg-dark-900/90 text-dark-100 backdrop-blur-sm p-4 text-left shadow-lg transition-all duration-200;
+}
+
+.react-flow__node.selected {
+  @apply border-brand-500 ring-2 ring-brand-500/20 shadow-brand-500/10 !important;
+}
+
+.react-flow__edge-path {
+  @apply stroke-dark-700 stroke-2;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  @apply stroke-brand-500 stroke-[3px] !important;
+}
+
+.react-flow__controls {
+  @apply bg-dark-900 border border-dark-800 rounded-lg overflow-hidden shadow-xl !important;
+}
+
+.react-flow__controls-button {
+  @apply bg-dark-900 text-dark-400 border-b border-dark-800 fill-current hover:bg-dark-800 hover:text-dark-100 !important;
+}

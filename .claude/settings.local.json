@@ -1,0 +1,32 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://openrouter.ai/api/v1",
+    "ANTHROPIC_AUTH_TOKEN": "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",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "openai/gpt-oss-120b:free"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(rm -rf .venv)",
+      "Bash(python -m venv .venv)",
+      "Bash(docker-compose ps:*)",
+      "Bash(python test_pipeline_full.py)",
+      "Bash(grep -E \"\\\\.\\(py|log|txt\\)$\")",
+      "Bash(python train_pipeline.py)",
+      "Bash(pip install:*)",
+      "Bash(source backend/venv/Scripts/activate)",
+      "Bash(python test_schema_generation.py)",
+      "Bash(python test_lime_car.py)",
+      "Bash(docker-compose exec:*)",
+      "Bash(docker-compose logs:*)",
+      "Bash(python \"Loan Prediction.py\")",
+      "Bash(python -m py_compile app/workers/tasks.py)",
+      "Read(//mnt/neha/desktop/ethics/xai-platform/**)",
+      "Bash(python -c \"import alibi; print\\('Alibi version:', alibi.__version__\\)\")",
+      "Bash(python *)"
+    ]
+  }
+}
+
+
