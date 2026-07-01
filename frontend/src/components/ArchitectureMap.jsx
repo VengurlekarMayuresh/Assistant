@@ -61,8 +61,16 @@ export default function ArchitectureMap({ repoId, onNodeClick }) {
       
       const handleClick = (e) => {
         let path = e.currentTarget.id;
-        // Remove common mermaid auto-generated prefixes/suffixes
-        path = path.replace(/^flowchart-/, '').replace(/-\d+$/, '');
+        // Remove common mermaid auto-generated prefixes
+        path = path.replace(/^flowchart-/, '');
+        // Remove mermaid auto-generated suffixes (e.g. -123)
+        path = path.replace(/-\d+$/, '');
+        // Remove any surrounding quotes
+        path = path.replace(/"/g, '');
+        // Sometimes Mermaid uses a different prefix in newer versions like `node-`
+        path = path.replace(/^node-/, '');
+        
+        console.log("Clicked Node Extracted Path:", path); // for debugging in browser console
         
         if (onNodeClick) {
           onNodeClick(path);
@@ -118,7 +126,8 @@ export default function ArchitectureMap({ repoId, onNodeClick }) {
         minScale={0.1}
         maxScale={4}
         centerOnInit={true}
-        wheel={{ step: 0.05, smoothStep: 0.005 }}
+        wheel={{ step: 0.05 }} // removed smoothStep as it can cause erratic scroll in some browsers
+        pinch={{ step: 5 }}
       >
         {({ zoomIn, zoomOut, resetTransform }) => (
           <>

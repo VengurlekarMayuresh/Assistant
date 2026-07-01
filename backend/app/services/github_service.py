@@ -150,7 +150,7 @@ class GitHubService:
                 
         return list(set(frameworks))
 
-    async def fetch_commits(self, owner: str, repo: str, per_page: int = 30) -> List[Dict[str, Any]]:
+    async def fetch_commits(self, owner: str, repo: str, per_page: int = 100) -> List[Dict[str, Any]]:
         """Fetch recent commits from the repository."""
         url = f"https://api.github.com/repos/{owner}/{repo}/commits"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -159,7 +159,7 @@ class GitHubService:
                 return resp.json()
             return []
 
-    async def fetch_pull_requests(self, owner: str, repo: str, state: str = "all", per_page: int = 20) -> List[Dict[str, Any]]:
+    async def fetch_pull_requests(self, owner: str, repo: str, state: str = "all", per_page: int = 100) -> List[Dict[str, Any]]:
         """Fetch recent pull requests from the repository."""
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
         async with httpx.AsyncClient(timeout=30.0) as client:
