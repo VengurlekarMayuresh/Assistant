@@ -191,16 +191,16 @@ async def search_knowledge_objects(
     client = get_qdrant_client()
     vector = embed_text(query)
 
-    results = await client.search(
+    results = await client.query_points(
         collection_name=COLLECTION_KNOWLEDGE,
-        query_vector=vector,
+        query=vector,
         query_filter=Filter(
             must=[FieldCondition(key="repository_id", match=MatchValue(value=repository_id))]
         ),
         limit=top_k,
         with_payload=True,
     )
-    return results
+    return results.points
 
 
 async def search_repository_files(
@@ -212,16 +212,16 @@ async def search_repository_files(
     client = get_qdrant_client()
     vector = embed_text(query)
 
-    results = await client.search(
+    results = await client.query_points(
         collection_name=COLLECTION_FILES,
-        query_vector=vector,
+        query=vector,
         query_filter=Filter(
             must=[FieldCondition(key="repository_id", match=MatchValue(value=repository_id))]
         ),
         limit=top_k,
         with_payload=True,
     )
-    return results
+    return results.points
 
 
 def _str_to_int_id(mongo_id: str) -> int:

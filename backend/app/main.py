@@ -277,12 +277,22 @@ async def get_repository_architecture(repo_id: str):
     repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
+    # 1. Check if we already have it cached
+    if repo.get("mermaid_architecture"):
+        return {"mermaid": repo["mermaid_architecture"]}
         
     tree_items = (repo.get("structure_json") or {}).get("tree", [])
     file_list = prune_structure(tree_items)
     
     from app.services.architecture_mapper import generate_mermaid_architecture
     mermaid_code = await generate_mermaid_architecture(repo, file_list)
+    
+    # 2. Save it to DB for next time
+    await repos_col.update_one(
+        {"_id": ObjectId(repo_id)},
+        {"$set": {"mermaid_architecture": mermaid_code}}
+    )
+    
     return {"mermaid": mermaid_code}
 
 

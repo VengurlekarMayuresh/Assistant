@@ -15,6 +15,7 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [isLoadingRepos, setIsLoadingRepos] = useState(false);
   const [activeTab, setActiveTab] = useState('architecture'); // 'architecture' | 'files' | 'overview' | 'history'
+  const [selectedFile, setSelectedFile] = useState(null);
 
   // Fetch all repositories from backend
   const fetchRepos = async () => {
@@ -41,6 +42,7 @@ export default function App() {
       setActiveSession(session);
       setMessages([]);
       setActiveTab('architecture'); // Default to architecture map
+      setSelectedFile(null);
     } catch (err) {
       console.error('Error starting session:', err);
       alert('Failed to start chat session with this repository. Check if backend is active.');
@@ -51,7 +53,14 @@ export default function App() {
     setActiveRepo(null);
     setActiveSession(null);
     setMessages([]);
+    setSelectedFile(null);
     fetchRepos();
+  };
+
+  const handleNodeClick = (filePath) => {
+    // When a node is clicked in ArchitectureMap, open the file explorer and select it
+    setSelectedFile(filePath);
+    setActiveTab('files');
   };
 
   const handleAddRepo = async (url) => {
@@ -162,11 +171,11 @@ export default function App() {
               {/* Tab Content Panel */}
               <div className="flex-1 p-6 min-h-[560px] md:min-h-0 overflow-hidden">
                 {activeTab === 'architecture' && (
-                  <ArchitectureMap repoId={activeRepo.id} />
+                  <ArchitectureMap repoId={activeRepo.id} onNodeClick={handleNodeClick} />
                 )}
 
                 {activeTab === 'files' && (
-                  <FileTree repo={activeRepo} structure={activeRepo.structure_json} />
+                  <FileTree repo={activeRepo} structure={activeRepo.structure_json} selectedFile={selectedFile} onFileSelect={setSelectedFile} />
                 )}
 
                 {activeTab === 'history' && (

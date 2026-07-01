@@ -20,6 +20,7 @@ from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from bson import ObjectId
 
 from app.config import settings
@@ -116,7 +117,7 @@ def prune_structure(tree_items: List[Dict], max_files: int = 120) -> List[str]:
 
 # ── Node 1: Planner (Semantic-Search-First + Neo4j graph expansion) ────────
 
-async def planner_node(state: AgentState, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def planner_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
     query = state["query"]
     file_list = state["file_list"]
     languages = state["languages"]
@@ -254,7 +255,7 @@ async def planner_node(state: AgentState, config: Optional[Dict[str, Any]] = Non
 
 # ── Node 2: Explorer (MongoDB cache-first + dynamic context expansion) ─────
 
-async def explorer_node(state: AgentState, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def explorer_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
     query = state["query"]
     plan = list(state["plan"])
     current_index = state["current_step_index"]
@@ -409,7 +410,7 @@ async def explorer_node(state: AgentState, config: Optional[Dict[str, Any]] = No
 
 # ── Node 3: Synthesizer (with background prefetch) ─────────────────────────
 
-async def synthesizer_node(state: AgentState, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def synthesizer_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
     query = state["query"]
     plan = state["plan"]
     step_findings = state["step_findings"]
