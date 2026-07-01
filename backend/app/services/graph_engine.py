@@ -16,6 +16,7 @@ from typing import List, Dict, Optional, Any
 
 from app.db.mongo import get_collection
 from app.db.neo4j_client import (
+    clear_file_imports,
     upsert_file_node,
     upsert_import_relationship,
     delete_file_node,
@@ -70,13 +71,15 @@ def _extract_python_imports(content: str, file_path: str, all_paths: List[str]) 
     resolved = []
     path_set = set(all_paths)
     for module in raw_modules:
-        candidate = module.replace(".", "/") + ".py"
-        if candidate in path_set:
-            resolved.append(candidate)
-        # Also check __init__.py
-        pkg_candidate = module.replace(".", "/") + "/__init__.py"
-        if pkg_candidate in path_set:
-            resolved.append(pkg_candidate)
+        candidate_root = module.replace(".", "/")
+        candidate_variants = [
+            candidate_root + ".py",
+            candidate_root + "/__init__.py",
+        ]
+        for candidate in candidate_variants:
+            for path in path_set:
+                if path == candidate or path.endswith("/" + candidate) or path.endswith(candidate):
+                    resolved.append(path)
 
     return list(set(resolved))
 
@@ -92,14 +95,30 @@ def _extract_js_imports(content: str, file_path: str, all_paths: List[str]) -> L
         raw = match.group(1) or match.group(2)
         if not raw or raw.startswith("@") and "/" not in raw[1:]:
             continue
+        candidate_bases = []
         if raw.startswith("."):
-            # Relative import
-            abs_path = os.path.normpath(os.path.join(base_dir, raw)).replace("\\", "/")
-            for ext in ["", ".js", ".ts", ".jsx", ".tsx", "/index.js", "/index.ts"]:
-                candidate = abs_path + ext
-                if candidate in path_set:
-                    resolved.append(candidate)
-                    break
+            candidate_bases.append(os.path.normpath(os.path.join(base_dir, raw)).replace("\\", "/"))
+        else:
+            normalized = raw.lstrip("@/").lstrip("~/")
+            candidate_bases.extend([
+                normalized,
+                f"src/{normalized}",
+                f"app/{normalized}",
+                f"components/{normalized}",
+                f"lib/{normalized}",
+                f"pages/{normalized}",
+            ])
+
+        for base in candidate_bases:
+            for ext in ["", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", "/index.js", "/index.ts", "/index.jsx", "/index.tsx"]:
+                candidate = base + ext
+                for path in path_set:
+                    if path == candidate or path.endswith("/" + candidate) or path.endswith(candidate):
+                        resolved.append(path)
+                        break
+                else:
+                    continue
+                break
 
     return list(set(resolved))
 
@@ -204,6 +223,9 @@ class GraphEngine:
 
             # Upsert node (MERGE handles create-or-update)
             await upsert_file_node(self.repository_id, path, language)
+
+            # Replace stale outgoing edges so changed imports do not linger in Neo4j.
+            await clear_file_imports(self.repository_id, path)
 
             # Re-parse imports for updated file
             imports = _extract_imports(path, content, all_paths)

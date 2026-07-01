@@ -4,7 +4,8 @@ import RepoGrid from './components/RepoGrid';
 import ChatPanel from './components/ChatPanel';
 import ArchitectureMap from './components/ArchitectureMap';
 import FileTree from './components/FileTree';
-import { GitBranch, Star, Code, BarChart2, MessageSquare, Compass, ShieldAlert, Cpu } from 'lucide-react';
+import GitHistory from './components/GitHistory';
+import { GitBranch, Star, Code, BarChart2, MessageSquare, Compass, ShieldAlert, Cpu, History } from 'lucide-react';
 import axios from 'axios';
 
 export default function App() {
@@ -13,7 +14,7 @@ export default function App() {
   const [activeSession, setActiveSession] = useState(null);
   const [messages, setMessages] = useState([]);
   const [isLoadingRepos, setIsLoadingRepos] = useState(false);
-  const [activeTab, setActiveTab] = useState('architecture'); // 'architecture' | 'files' | 'overview'
+  const [activeTab, setActiveTab] = useState('architecture'); // 'architecture' | 'files' | 'overview' | 'history'
 
   // Fetch all repositories from backend
   const fetchRepos = async () => {
@@ -103,10 +104,10 @@ export default function App() {
             <div className="flex-1 flex flex-col h-full min-h-0 bg-dark-950/20">
               {/* Tab Navigation header */}
               <div className="border-b border-dark-800 bg-dark-900/40 px-6 py-2 flex items-center justify-between">
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   <button
                     onClick={() => setActiveTab('architecture')}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold border transition-all ${
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
                       activeTab === 'architecture'
                         ? 'bg-brand-500/10 text-brand-300 border-brand-500/20'
                         : 'text-dark-400 hover:text-dark-100 border-transparent'
@@ -118,7 +119,7 @@ export default function App() {
 
                   <button
                     onClick={() => setActiveTab('files')}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold border transition-all ${
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
                       activeTab === 'files'
                         ? 'bg-brand-500/10 text-brand-300 border-brand-500/20'
                         : 'text-dark-400 hover:text-dark-100 border-transparent'
@@ -130,7 +131,7 @@ export default function App() {
 
                   <button
                     onClick={() => setActiveTab('overview')}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold border transition-all ${
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
                       activeTab === 'overview'
                         ? 'bg-brand-500/10 text-brand-300 border-brand-500/20'
                         : 'text-dark-400 hover:text-dark-100 border-transparent'
@@ -138,6 +139,18 @@ export default function App() {
                   >
                     <BarChart2 className="h-3.5 w-3.5" />
                     <span>Repository Overview</span>
+                  </button>
+
+                  <button
+                    onClick={() => setActiveTab('history')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
+                      activeTab === 'history'
+                        ? 'bg-brand-500/10 text-brand-300 border-brand-500/20'
+                        : 'text-dark-400 hover:text-dark-100 border-transparent'
+                    }`}
+                  >
+                    <History className="h-3.5 w-3.5" />
+                    <span>Git History</span>
                   </button>
                 </div>
 
@@ -147,13 +160,17 @@ export default function App() {
               </div>
 
               {/* Tab Content Panel */}
-              <div className="flex-1 p-6 min-h-[420px] md:min-h-0 overflow-hidden">
+              <div className="flex-1 p-6 min-h-[560px] md:min-h-0 overflow-hidden">
                 {activeTab === 'architecture' && (
-                  <ArchitectureMap structure={activeRepo.structure_json} />
+                  <ArchitectureMap repoId={activeRepo.id} />
                 )}
 
                 {activeTab === 'files' && (
                   <FileTree repo={activeRepo} structure={activeRepo.structure_json} />
+                )}
+
+                {activeTab === 'history' && (
+                  <GitHistory repoId={activeRepo.id} />
                 )}
 
                 {activeTab === 'overview' && (

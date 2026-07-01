@@ -240,6 +240,52 @@ async def get_file_dependencies(repo_id: str, path: str, depth: int = 2):
     }
 
 
+@app.get("/api/repositories/{repo_id}/commits")
+async def get_repository_commits(repo_id: str):
+    """Fetch recent commits for the repository."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    try:
+        gh = GitHubService()
+        commits = await gh.fetch_commits(repo["owner"], repo["name"])
+        return commits
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/repositories/{repo_id}/prs")
+async def get_repository_prs(repo_id: str):
+    """Fetch recent pull requests for the repository."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    try:
+        gh = GitHubService()
+        prs = await gh.fetch_pull_requests(repo["owner"], repo["name"])
+        return prs
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/repositories/{repo_id}/architecture")
+async def get_repository_architecture(repo_id: str):
+    """Generate a Mermaid architecture diagram using LLM."""
+    repos_col = get_collection("repositories")
+    repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+        
+    tree_items = (repo.get("structure_json") or {}).get("tree", [])
+    file_list = prune_structure(tree_items)
+    
+    from app.services.architecture_mapper import generate_mermaid_architecture
+    mermaid_code = await generate_mermaid_architecture(repo, file_list)
+    return {"mermaid": mermaid_code}
+
+
 # ── CHAT SESSION ENDPOINTS ─────────────────────────────────────────────────
 
 @app.post("/api/sessions", response_model=ChatSessionOut, status_code=status.HTTP_201_CREATED)

@@ -149,3 +149,22 @@ class GitHubService:
                 frameworks.append("Alembic")
                 
         return list(set(frameworks))
+
+    async def fetch_commits(self, owner: str, repo: str, per_page: int = 30) -> List[Dict[str, Any]]:
+        """Fetch recent commits from the repository."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=self.headers, params={"per_page": per_page})
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+
+    async def fetch_pull_requests(self, owner: str, repo: str, state: str = "all", per_page: int = 20) -> List[Dict[str, Any]]:
+        """Fetch recent pull requests from the repository."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=self.headers, params={"state": state, "per_page": per_page})
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+

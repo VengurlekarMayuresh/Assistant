@@ -12,15 +12,248 @@ Cloud: set NEO4J_URI (neo4j+s://xxx.databases.neo4j.io), NEO4J_USER, NEO4J_PASSW
 from your Neo4j AuraDB instance dashboard.
 """
 import logging
+import os
+import re
 from typing import List, Dict, Any, Optional
 
+from bson import ObjectId
 from neo4j import AsyncGraphDatabase, AsyncDriver
 
 from app.config import settings
+from app.db.mongo import get_collection
+from app.services.github_service import GitHubService
 
 logger = logging.getLogger(__name__)
 
 _driver: AsyncDriver | None = None
+
+PYTHON_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.,\s]+))",
+    re.MULTILINE,
+)
+JS_IMPORT_RE = re.compile(
+    r"""(?:import\s+.*?from\s+['\"]([^'\"]+)['\"]|require\s*\(\s*['\"]([^'\"]+)['\"]\s*\))""",
+    re.MULTILINE,
+)
+
+
+def _detect_language(path: str) -> str:
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return {
+        "py": "python",
+        "js": "javascript",
+        "ts": "typescript",
+        "jsx": "javascript",
+        "tsx": "typescript",
+        "java": "java",
+        "go": "go",
+        "rs": "rust",
+        "rb": "ruby",
+        "php": "php",
+    }.get(ext, "unknown")
+
+
+def _match_paths(candidates: List[str], all_paths: List[str]) -> List[str]:
+    path_set = set(all_paths)
+    resolved: List[str] = []
+    for candidate in candidates:
+        for path in path_set:
+            if path == candidate or path.endswith("/" + candidate) or path.endswith(candidate):
+                resolved.append(path)
+    return list(set(resolved))
+
+
+def _extract_python_imports(content: str, all_paths: List[str]) -> List[str]:
+    raw_modules = []
+    for match in PYTHON_IMPORT_RE.finditer(content):
+        module = match.group(1) or match.group(2)
+        if module:
+            for part in module.split(","):
+                raw_modules.append(part.strip().split(" ")[0])
+
+    candidates: List[str] = []
+    for module in raw_modules:
+        root = module.replace(".", "/")
+        candidates.extend([root + ".py", root + "/__init__.py"])
+
+    return _match_paths(candidates, all_paths)
+
+
+def _extract_js_imports(content: str, file_path: str, all_paths: List[str]) -> List[str]:
+    base_dir = os.path.dirname(file_path)
+    candidates: List[str] = []
+
+    for match in JS_IMPORT_RE.finditer(content):
+        raw = match.group(1) or match.group(2)
+        if not raw or raw.startswith("@") and "/" not in raw[1:]:
+            continue
+
+        candidate_bases: List[str] = []
+        if raw.startswith("."):
+            candidate_bases.append(os.path.normpath(os.path.join(base_dir, raw)).replace("\\", "/"))
+        else:
+            normalized = raw.lstrip("@/").lstrip("~/")
+            candidate_bases.extend([
+                normalized,
+                f"src/{normalized}",
+                f"app/{normalized}",
+                f"components/{normalized}",
+                f"lib/{normalized}",
+                f"pages/{normalized}",
+            ])
+
+        for base in candidate_bases:
+            for ext in ["", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", "/index.js", "/index.ts", "/index.jsx", "/index.tsx"]:
+                candidates.append(base + ext)
+
+    return _match_paths(candidates, all_paths)
+
+
+def _extract_imports(path: str, content: str, all_paths: List[str]) -> List[str]:
+    lang = _detect_language(path)
+    if lang == "python":
+        return _extract_python_imports(content, all_paths)
+    if lang in ("javascript", "typescript"):
+        return _extract_js_imports(content, path, all_paths)
+    return []
+
+
+async def _load_local_repository_files(repo_id: str) -> List[Dict[str, Any]]:
+    files_col = get_collection("repository_files")
+    cursor = files_col.find({"repository_id": repo_id})
+    return await cursor.to_list(length=None)
+
+
+async def _load_repository_context(repo_id: str) -> tuple[dict[str, Any], List[str]]:
+    repos_col = get_collection("repositories")
+    try:
+        repo = await repos_col.find_one({"_id": ObjectId(repo_id)})
+    except Exception:
+        repo = await repos_col.find_one({"_id": repo_id})
+    if not repo:
+        return {}, []
+
+    tree_items = (repo.get("structure_json") or {}).get("tree", [])
+    all_paths = [item.get("path", "") for item in tree_items if item.get("path")]
+    return repo, all_paths
+
+
+def _prune_tree_paths(tree_items: List[Dict[str, Any]], max_files: int = 150) -> List[str]:
+    code_extensions = {
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
+        ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".swift", ".kt",
+        ".json", ".yaml", ".yml", ".toml", ".env", ".md", ".txt",
+        ".html", ".css", ".scss", ".sql",
+    }
+    excluded_dirs = {
+        "node_modules", ".git", "__pycache__", ".venv", "venv",
+        "dist", "build", ".next", "vendor", "coverage",
+    }
+
+    paths: List[str] = []
+    for item in tree_items:
+        if item.get("type") != "blob":
+            continue
+        path = item.get("path", "")
+        if not path:
+            continue
+        if any(part in excluded_dirs for part in path.split("/")):
+            continue
+        ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in code_extensions or path in {"Makefile", "Dockerfile", "Procfile"}:
+            paths.append(path)
+        if len(paths) >= max_files:
+            break
+    return paths
+
+
+async def _fetch_repo_file_content(owner: str, name: str, path: str) -> str:
+    gh = GitHubService()
+    for branch in ["main", "master"]:
+        try:
+            return await gh.fetch_file_content(owner, name, path, branch)
+        except Exception:
+            continue
+    raise RuntimeError(f"Failed to fetch file content for {path}")
+
+
+async def _build_local_dependency_maps(repo_id: str) -> tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    docs = await _load_local_repository_files(repo_id)
+    repo, repo_paths = await _load_repository_context(repo_id)
+    all_paths = list({doc.get("path", "") for doc in docs if doc.get("path")})
+    all_paths.extend([path for path in repo_paths if path not in all_paths])
+
+    outgoing: Dict[str, List[str]] = {}
+    incoming: Dict[str, List[str]] = {}
+
+    doc_by_path = {doc.get("path", ""): doc for doc in docs if doc.get("path")}
+
+    if repo and repo_paths:
+        key_paths = _prune_tree_paths((repo.get("structure_json") or {}).get("tree", []), max_files=150)
+        for path in key_paths:
+            if path not in all_paths:
+                all_paths.append(path)
+            if path in doc_by_path:
+                continue
+            try:
+                content = await _fetch_repo_file_content(repo["owner"], repo["name"], path)
+                doc_by_path[path] = {"path": path, "content": content}
+            except Exception:
+                continue
+
+    for path, doc in doc_by_path.items():
+        path = doc.get("path", "")
+        content = doc.get("content", "")
+        deps = _extract_imports(path, content, all_paths)
+        outgoing[path] = deps
+        for dep in deps:
+            incoming.setdefault(dep, []).append(path)
+
+    return outgoing, incoming
+
+
+def _walk_dependency_graph(start: str, adjacency: Dict[str, List[str]], depth: int) -> List[str]:
+    seen = {start}
+    frontier = [start]
+    result: List[str] = []
+
+    for _ in range(depth):
+        next_frontier: List[str] = []
+        for node in frontier:
+            for neighbor in adjacency.get(node, []):
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                result.append(neighbor)
+                next_frontier.append(neighbor)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    return result
+
+
+async def _get_local_dependencies(repo_id: str, path: str, depth: int) -> List[Dict[str, Any]]:
+    outgoing, _ = await _build_local_dependency_maps(repo_id)
+    deps = _walk_dependency_graph(path, outgoing, depth)
+    return [{"path": dep, "depth": 1} for dep in deps]
+
+
+async def _get_local_dependents(repo_id: str, path: str, depth: int) -> List[Dict[str, Any]]:
+    _, incoming = await _build_local_dependency_maps(repo_id)
+    deps = _walk_dependency_graph(path, incoming, depth)
+    return [{"path": dep, "depth": 1} for dep in deps]
+
+
+async def _get_local_related_files(repo_id: str, seed_paths: List[str], depth: int) -> List[str]:
+    outgoing, incoming = await _build_local_dependency_maps(repo_id)
+    related = set(seed_paths)
+
+    for seed in seed_paths:
+        related.update(_walk_dependency_graph(seed, outgoing, depth))
+        related.update(_walk_dependency_graph(seed, incoming, depth))
+
+    return list(related)
 
 
 def _log_neo4j_error(action: str, error: Exception) -> None:
@@ -119,6 +352,23 @@ async def upsert_import_relationship(
         _log_neo4j_error(f"upsert_import_relationship({from_path} -> {to_path})", error)
 
 
+async def clear_file_imports(repo_id: str, path: str):
+    """Remove all outgoing IMPORTS relationships for a given file."""
+    try:
+        driver = get_neo4j_driver()
+        async with driver.session() as session:
+            await session.run(
+                """
+                MATCH (a:File {path: $path, repo_id: $repo_id})-[r:IMPORTS]->()
+                DELETE r
+                """,
+                path=path,
+                repo_id=repo_id,
+            )
+    except Exception as error:
+        _log_neo4j_error(f"clear_file_imports({path})", error)
+
+
 async def delete_file_node(repo_id: str, path: str):
     """Remove a File node and all its relationships."""
     try:
@@ -154,10 +404,12 @@ async def get_file_dependencies(repo_id: str, path: str, depth: int = 2) -> List
                 repo_id=repo_id,
             )
             records = await result.data()
-            return records
+            if records:
+                return records
     except Exception as error:
         _log_neo4j_error(f"get_file_dependencies({path})", error)
-        return []
+
+    return await _get_local_dependencies(repo_id, path, depth)
 
 
 async def get_file_dependents(repo_id: str, path: str, depth: int = 2) -> List[Dict[str, Any]]:
@@ -178,10 +430,12 @@ async def get_file_dependents(repo_id: str, path: str, depth: int = 2) -> List[D
                 repo_id=repo_id,
             )
             records = await result.data()
-            return records
+            if records:
+                return records
     except Exception as error:
         _log_neo4j_error(f"get_file_dependents({path})", error)
-        return []
+
+    return await _get_local_dependents(repo_id, path, depth)
 
 
 async def get_related_files_for_query(
@@ -215,10 +469,12 @@ async def get_related_files_for_query(
             for rec in records:
                 related.add(rec["path"])
 
-        return list(related)
+        if len(related) > len(seed_paths):
+            return list(related)
     except Exception as error:
         _log_neo4j_error(f"get_related_files_for_query({len(seed_paths)} seeds)", error)
-        return list(seed_paths)
+
+    return await _get_local_related_files(repo_id, seed_paths, depth)
 
 
 async def delete_repo_graph(repo_id: str):
