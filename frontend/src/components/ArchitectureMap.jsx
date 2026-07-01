@@ -118,7 +118,7 @@ export default function ArchitectureMap({ repoId, onNodeClick }) {
         minScale={0.1}
         maxScale={4}
         centerOnInit={true}
-        wheel={{ step: 0.1 }}
+        wheel={{ step: 0.05, smoothStep: 0.005 }}
       >
         {({ zoomIn, zoomOut, resetTransform }) => (
           <>
