@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import Navbar from './components/Navbar';
 import RepoGrid from './components/RepoGrid';
 import ChatPanel from './components/ChatPanel';
+import ChatHistory from './components/ChatHistory';
 import ArchitectureMap from './components/ArchitectureMap';
 import FileTree from './components/FileTree';
 import GitHistory from './components/GitHistory';
@@ -12,10 +13,12 @@ export default function App() {
   const [repos, setRepos] = useState([]);
   const [activeRepo, setActiveRepo] = useState(null);
   const [activeSession, setActiveSession] = useState(null);
+  const [sessions, setSessions] = useState([]); // All sessions for active repo
   const [messages, setMessages] = useState([]);
   const [isLoadingRepos, setIsLoadingRepos] = useState(false);
   const [activeTab, setActiveTab] = useState('architecture'); // 'architecture' | 'files' | 'overview' | 'history'
   const [selectedFile, setSelectedFile] = useState(null);
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState(false);
 
   // Fetch all repositories from backend
   const fetchRepos = async () => {
@@ -31,36 +34,122 @@ export default function App() {
     fetchRepos();
   }, []);
 
+  // Fetch sessions for a specific repo
+  const fetchSessions = async (repoId) => {
+    try {
+      const response = await axios.get(`http://localhost:8000/api/sessions?repository_id=${repoId}`);
+      setSessions(response.data);
+      return response.data;
+    } catch (err) {
+      console.error('Error fetching sessions:', err);
+      return [];
+    }
+  };
+
+  // Load messages for a session
+  const loadSessionMessages = async (sessionId) => {
+    try {
+      const response = await axios.get(`http://localhost:8000/api/sessions/${sessionId}/messages`);
+      const msgs = response.data.map(m => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+      }));
+      setMessages(msgs);
+    } catch (err) {
+      console.error('Error loading session messages:', err);
+      setMessages([]);
+    }
+  };
+
+  // When user selects a repo from the grid
   const handleSelectRepo = async (repo) => {
     try {
-      const res = await axios.post('http://localhost:8000/api/sessions', {
-        repository_id: repo.id
-      });
-      const session = res.data;
-      
       setActiveRepo(repo);
-      setActiveSession(session);
-      setMessages([]);
-      setActiveTab('architecture'); // Default to architecture map
+      setActiveTab('architecture');
       setSelectedFile(null);
+
+      // Fetch existing sessions for this repo
+      const existingSessions = await fetchSessions(repo.id);
+
+      if (existingSessions.length > 0) {
+        // Resume the most recent session
+        const latestSession = existingSessions[0];
+        setActiveSession(latestSession);
+        await loadSessionMessages(latestSession.id);
+      } else {
+        // No existing sessions — create a new one
+        await handleNewSession(repo);
+      }
     } catch (err) {
       console.error('Error starting session:', err);
       alert('Failed to start chat session with this repository. Check if backend is active.');
     }
   };
 
+  // Create a new session for the active repo
+  const handleNewSession = async (repoOverride = null) => {
+    const repo = repoOverride || activeRepo;
+    if (!repo) return;
+
+    try {
+      const res = await axios.post('http://localhost:8000/api/sessions', {
+        repository_id: repo.id
+      });
+      const session = res.data;
+
+      setActiveSession(session);
+      setMessages([]);
+
+      // Refresh the session list
+      await fetchSessions(repo.id);
+    } catch (err) {
+      console.error('Error creating new session:', err);
+    }
+  };
+
+  // Resume an existing session
+  const handleResumeSession = async (session) => {
+    setActiveSession(session);
+    await loadSessionMessages(session.id);
+  };
+
+  // Delete a session
+  const handleDeleteSession = async (sessionId) => {
+    try {
+      await axios.delete(`http://localhost:8000/api/sessions/${sessionId}`);
+
+      // If we deleted the active session, switch to another or create new
+      if (activeSession && activeSession.id === sessionId) {
+        const remaining = sessions.filter(s => s.id !== sessionId);
+        if (remaining.length > 0) {
+          setActiveSession(remaining[0]);
+          await loadSessionMessages(remaining[0].id);
+        } else {
+          await handleNewSession();
+        }
+      }
+
+      // Refresh sessions list
+      await fetchSessions(activeRepo.id);
+    } catch (err) {
+      console.error('Error deleting session:', err);
+    }
+  };
+
   const handleBackToDashboard = () => {
     setActiveRepo(null);
     setActiveSession(null);
+    setSessions([]);
     setMessages([]);
     setSelectedFile(null);
     fetchRepos();
   };
 
   const handleNodeClick = (filePath) => {
-    // When a node is clicked in ArchitectureMap, open the file explorer and select it
     setSelectedFile(filePath);
     setActiveTab('files');
+    setIsRightPanelOpen(true);
   };
 
   const handleAddRepo = async (url) => {
@@ -77,7 +166,7 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col min-h-screen bg-dark-950 text-dark-100 font-sans">
+    <div className="flex flex-col h-screen overflow-hidden bg-dark-950 text-dark-100 font-sans">
       <Navbar activeRepo={activeRepo} onBack={handleBackToDashboard} />
 
       <main className="flex-1 flex flex-col min-h-0">
@@ -91,17 +180,49 @@ export default function App() {
           />
         ) : (
           // Exploration Workspace view (split view)
-          <div className="flex-1 flex flex-col md:flex-row min-h-0 h-[calc(100vh-4rem)]">
+          <div className="flex-1 flex flex-col md:flex-row min-h-0 overflow-hidden">
             
-            {/* Left Column: Chat & Agent Logs Checklist (40% width) */}
-            <div className="w-full md:w-[38%] border-r border-dark-800 flex flex-col h-full bg-dark-950/40">
-              <div className="px-6 py-4 border-b border-dark-800 bg-dark-900/40 flex items-center gap-2">
-                <MessageSquare className="h-4 w-4 text-brand-400" />
-                <span className="text-xs font-bold text-white tracking-wider">AGENT CHAT WORKSPACE</span>
+            {/* Far-left Column: Chat History Sidebar */}
+            <div className="hidden md:flex w-56 border-r border-dark-800 bg-dark-950/60 flex-col h-full overflow-hidden flex-shrink-0">
+              <div className="px-3 py-3 border-b border-dark-800 bg-dark-900/40">
+                <span className="text-[10px] font-bold text-dark-400 tracking-wider">CHAT HISTORY</span>
               </div>
-              <div className="flex-1 min-h-0">
+              <ChatHistory
+                sessions={sessions}
+                activeSessionId={activeSession?.id}
+                onSelectSession={handleResumeSession}
+                onNewSession={() => handleNewSession()}
+                onDeleteSession={handleDeleteSession}
+              />
+            </div>
+
+            {/* Middle Column: Chat & Agent Logs */}
+            <div className={`w-full ${isRightPanelOpen ? 'hidden' : 'flex-1'} border-r border-dark-800 flex flex-col h-full overflow-hidden bg-dark-950/40`}>
+              <div className="px-6 py-4 border-b border-dark-800 bg-dark-900/40 flex items-center justify-between flex-shrink-0">
+                <div className="flex items-center gap-2">
+                  <MessageSquare className="h-4 w-4 text-brand-400" />
+                  <span className="text-xs font-bold text-white tracking-wider">AGENT CHAT WORKSPACE</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  {/* Mobile: New Chat button */}
+                  <button
+                    onClick={() => handleNewSession()}
+                    className="md:hidden text-[10px] font-bold text-brand-400 hover:text-brand-300"
+                  >
+                    + New Chat
+                  </button>
+                  <button
+                    onClick={() => setIsRightPanelOpen(true)}
+                    className="text-xs font-bold bg-brand-600 hover:bg-brand-500 text-white px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5"
+                  >
+                    <Code className="h-3.5 w-3.5" />
+                    View Codebase
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 min-h-0 flex flex-col">
                 <ChatPanel
-                  sessionId={activeSession.id}
+                  sessionId={activeSession?.id}
                   messages={messages}
                   setMessages={setMessages}
                   activeRepo={activeRepo}
@@ -109,11 +230,17 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right Column: Codebase Navigation & React Flow (62% width) */}
-            <div className="flex-1 flex flex-col h-full min-h-0 bg-dark-950/20">
+            {/* Right Column: Codebase Navigation & React Flow */}
+            <div className={`w-full ${isRightPanelOpen ? 'flex-1' : 'hidden'} flex flex-col h-full min-h-0 overflow-hidden bg-dark-950/20`}>
               {/* Tab Navigation header */}
-              <div className="border-b border-dark-800 bg-dark-900/40 px-6 py-2 flex items-center justify-between">
-                <div className="flex gap-2 flex-wrap">
+              <div className="border-b border-dark-800 bg-dark-900/40 px-6 py-2 flex items-center justify-between flex-shrink-0">
+                <div className="flex gap-2 flex-wrap items-center">
+                  <button
+                    onClick={() => setIsRightPanelOpen(false)}
+                    className="mr-2 text-xs font-bold text-dark-300 hover:text-white bg-dark-800 hover:bg-dark-700 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5"
+                  >
+                    ← Back to Chat
+                  </button>
                   <button
                     onClick={() => setActiveTab('architecture')}
                     className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
@@ -164,12 +291,12 @@ export default function App() {
                 </div>
 
                 <div className="text-[10px] font-mono text-dark-500 hidden sm:block">
-                  Workspace Session: {activeSession.id.slice(0, 8)}...
+                  Workspace Session: {activeSession?.id?.slice(0, 8)}...
                 </div>
               </div>
 
               {/* Tab Content Panel */}
-              <div className="flex-1 p-6 min-h-[560px] md:min-h-0 overflow-hidden">
+              <div className="flex-1 p-6 min-h-0 overflow-auto">
                 {activeTab === 'architecture' && (
                   <ArchitectureMap repoId={activeRepo.id} onNodeClick={handleNodeClick} />
                 )}

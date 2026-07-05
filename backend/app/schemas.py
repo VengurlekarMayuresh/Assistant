@@ -43,6 +43,7 @@ class ChatSessionOut(BaseModel):
     title: str
     created_at: datetime
     repository: Optional[RepositoryOut] = None
+    message_count: Optional[int] = 0
 
     model_config = {"from_attributes": True}
 

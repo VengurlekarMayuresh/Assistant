@@ -8,6 +8,8 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
   const [currentStep, setCurrentStep] = useState(-1);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [showLogs, setShowLogs] = useState(true);
+  const [streamingContent, setStreamingContent] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
   
   const wsRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -16,18 +18,22 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
   // Auto scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isAgentRunning]);
+  }, [messages, isAgentRunning, streamingContent]);
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  // Load existing logs and messages for this session
+  // Load existing logs for this session + establish WebSocket
   useEffect(() => {
+    if (!sessionId) return;
+
     setLogs([]);
     setPlan([]);
     setCurrentStep(-1);
     setIsAgentRunning(false);
+    setStreamingContent('');
+    setIsStreaming(false);
 
     // Fetch historic logs
     fetch(`http://localhost:8000/api/sessions/${sessionId}/logs`)
@@ -79,8 +85,19 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
           setCurrentStep(data.data.step_index);
         }
       } 
+      else if (data.type === 'stream') {
+        // Token-by-token streaming from Synthesizer
+        setIsStreaming(true);
+        setStreamingContent((prev) => prev + (data.token || ''));
+      }
+      else if (data.type === 'stream_end') {
+        // Streaming finished — content will arrive as a full "message" next
+        setIsStreaming(false);
+      }
       else if (data.type === 'message') {
         setIsAgentRunning(false);
+        setIsStreaming(false);
+        setStreamingContent('');
         setMessages((prev) => [...prev, {
           id: Date.now(),
           role: data.role,
@@ -89,6 +106,8 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
       } 
       else if (data.type === 'error') {
         setIsAgentRunning(false);
+        setIsStreaming(false);
+        setStreamingContent('');
         setLogs((prev) => [...prev, {
           agent: 'System',
           action: 'error',
@@ -125,6 +144,8 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
 
     setInput('');
     setIsAgentRunning(true);
+    setStreamingContent('');
+    setIsStreaming(false);
     
     // Send to agent server via WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -194,11 +215,11 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
   };
 
   return (
-    <div className="flex flex-col h-full bg-dark-900/30">
+    <div className="flex flex-col h-full min-h-0 bg-dark-900/30">
       
       {/* Workspace Area: Messages + Agent status */}
       <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
-        {messages.length === 0 ? (
+        {messages.length === 0 && !isAgentRunning ? (
           <div className="flex flex-col items-center justify-center h-full text-center max-w-md mx-auto pt-20">
             <div className="h-12 w-12 rounded-2xl bg-brand-500/10 border border-brand-500/20 flex items-center justify-center text-brand-400 mb-4 animate-pulse">
               <Sparkles className="h-6 w-6" />
@@ -211,31 +232,51 @@ export default function ChatPanel({ sessionId, messages, setMessages, activeRepo
             </p>
           </div>
         ) : (
-          messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
-            >
+          <>
+            {messages.map((msg) => (
               <div
-                className={`max-w-[85%] rounded-2xl p-4 text-left border ${
-                  msg.role === 'user'
-                    ? 'bg-brand-600 text-white border-brand-500/20 shadow-md shadow-brand-600/10 rounded-tr-none'
-                    : 'bg-dark-900/80 text-dark-100 border-dark-800/80 rounded-tl-none'
-                }`}
+                key={msg.id}
+                className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
               >
-                <div className="text-[10px] font-semibold tracking-wider text-dark-400 mb-1.5">
-                  {msg.role === 'user' ? 'DEVELOPER' : 'REPOMIND AGENT'}
-                </div>
-                <div className="text-sm">
-                  {msg.role === 'user' ? (
-                    <p className="whitespace-pre-line leading-relaxed">{msg.content}</p>
-                  ) : (
-                    renderMarkdown(msg.content)
-                  )}
+                <div
+                  className={`max-w-[85%] rounded-2xl p-4 text-left border ${
+                    msg.role === 'user'
+                      ? 'bg-brand-600 text-white border-brand-500/20 shadow-md shadow-brand-600/10 rounded-tr-none'
+                      : 'bg-dark-900/80 text-dark-100 border-dark-800/80 rounded-tl-none'
+                  }`}
+                >
+                  <div className="text-[10px] font-semibold tracking-wider text-dark-400 mb-1.5">
+                    {msg.role === 'user' ? 'DEVELOPER' : 'REPOMIND AGENT'}
+                  </div>
+                  <div className="text-sm">
+                    {msg.role === 'user' ? (
+                      <p className="whitespace-pre-line leading-relaxed">{msg.content}</p>
+                    ) : (
+                      renderMarkdown(msg.content)
+                    )}
+                  </div>
                 </div>
               </div>
+            ))}
+          </>
+        )}
+
+        {/* Live Streaming Response Bubble */}
+        {(isStreaming || streamingContent) && (
+          <div className="flex flex-col items-start">
+            <div className="max-w-[85%] rounded-2xl p-4 text-left border bg-dark-900/80 text-dark-100 border-dark-800/80 rounded-tl-none">
+              <div className="text-[10px] font-semibold tracking-wider text-brand-400 mb-1.5 flex items-center gap-1.5">
+                <Sparkles className="h-3 w-3 animate-pulse" />
+                <span>REPOMIND AGENT · STREAMING</span>
+              </div>
+              <div className="text-sm">
+                {renderMarkdown(streamingContent)}
+                {isStreaming && (
+                  <span className="inline-block w-2 h-4 bg-brand-400 animate-pulse ml-0.5 rounded-sm" />
+                )}
+              </div>
             </div>
-          ))
+          </div>
         )}
 
         {/* Live Agent Executing Card */}

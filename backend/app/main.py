@@ -9,10 +9,10 @@ Database stack:
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Any
+from typing import List, Any, Optional
 
 from bson import ObjectId
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -29,6 +29,7 @@ from app.schemas import (
 )
 from app.services.github_service import GitHubService
 from app.services.sync_engine import SyncEngine
+from app.services.cleanup import run_startup_cleanup
 from app.agents.agent_graph import build_agent_graph, prune_structure
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,16 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize all three database connections on startup."""
+    """Initialize all three database connections + run cleanup on startup."""
     await init_db()
     await init_qdrant_collections()
     await init_neo4j_driver()
     logger.info("All database connections initialized: MongoDB ✓  Qdrant ✓  Neo4j ✓")
+    # Purge orphan Qdrant vectors / Neo4j nodes for TTL-expired repos
+    try:
+        await run_startup_cleanup()
+    except Exception as e:
+        logger.warning(f"Startup cleanup had errors (non-fatal): {e}")
 
 
 @app.on_event("shutdown")
@@ -310,7 +316,7 @@ async def create_chat_session(payload: ChatSessionCreate):
     session_doc = {
         "_id": str(uuid.uuid4()),
         "repository_id": payload.repository_id,
-        "title": f"Exploration of {repo['owner']}/{repo['name']}",
+        "title": f"New chat — {repo['owner']}/{repo['name']}",
         "created_at": datetime.utcnow(),
     }
     await sessions_col.insert_one(session_doc)
@@ -322,23 +328,51 @@ async def create_chat_session(payload: ChatSessionCreate):
         "title": session_doc["title"],
         "created_at": session_doc["created_at"],
         "repository": repo_out,
+        "message_count": 0,
     }
 
 
 @app.get("/api/sessions", response_model=List[ChatSessionOut])
-async def list_chat_sessions():
+async def list_chat_sessions(repository_id: Optional[str] = Query(None)):
+    """List sessions, optionally filtered by repository_id."""
     sessions_col = get_collection("chat_sessions")
     repos_col = get_collection("repositories")
-    cursor = sessions_col.find().sort("created_at", -1)
+    messages_col = get_collection("chat_messages")
+
+    query_filter = {}
+    if repository_id:
+        query_filter["repository_id"] = repository_id
+
+    cursor = sessions_col.find(query_filter).sort("created_at", -1)
     sessions = await cursor.to_list(length=200)
 
     result = []
     for s in sessions:
         repo = await repos_col.find_one({"_id": ObjectId(s["repository_id"])})
-        s["id"] = s.pop("_id") if "_id" in s else s.get("id")
+        session_id = s.pop("_id") if "_id" in s else s.get("id")
+        s["id"] = session_id
         s["repository"] = _repo_doc_to_out(repo) if repo else None
+        # Count messages for this session
+        msg_count = await messages_col.count_documents({"session_id": session_id})
+        s["message_count"] = msg_count
         result.append(s)
     return result
+
+
+@app.delete("/api/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat_session(session_id: str):
+    """Delete a session and all its messages and agent logs."""
+    sessions_col = get_collection("chat_sessions")
+    messages_col = get_collection("chat_messages")
+    logs_col = get_collection("agent_action_logs")
+
+    session = await sessions_col.find_one({"_id": session_id})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    await messages_col.delete_many({"session_id": session_id})
+    await logs_col.delete_many({"session_id": session_id})
+    await sessions_col.delete_one({"_id": session_id})
 
 
 @app.get("/api/sessions/{session_id}/messages", response_model=List[ChatMessageOut])
@@ -391,6 +425,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str):
         messages_col = get_collection("chat_messages")
         logs_col = get_collection("agent_action_logs")
 
+        is_first_message_in_session = True
+
         while True:
             data = await websocket.receive_json()
             user_query = data.get("content", "").strip()
@@ -404,6 +440,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str):
                 "content": user_query,
                 "created_at": datetime.utcnow(),
             })
+
+            # Auto-title session from first user message
+            if is_first_message_in_session:
+                is_first_message_in_session = False
+                existing_msgs = await messages_col.count_documents({"session_id": session_id})
+                if existing_msgs <= 1:  # This is truly the first message
+                    title = user_query[:80] + ("..." if len(user_query) > 80 else "")
+                    await sessions_col.update_one(
+                        {"_id": session_id},
+                        {"$set": {"title": title}}
+                    )
 
             # Log callback — persists to MongoDB and streams to WebSocket
             async def log_callback(agent_name: str, action_type: str, message: str, data: Any = None):
@@ -421,6 +468,13 @@ async def chat_websocket(websocket: WebSocket, session_id: str):
                     "action": action_type,
                     "message": message,
                     "data": data,
+                })
+
+            # Stream callback — sends tokens one-by-one to frontend
+            async def stream_callback(token: str):
+                await websocket.send_json({
+                    "type": "stream",
+                    "token": token,
                 })
 
             # Build initial state
@@ -442,11 +496,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str):
             }
 
             graph = build_agent_graph()
-            config = {"configurable": {"log_callback": log_callback}}
+            config = {"configurable": {
+                "log_callback": log_callback,
+                "stream_callback": stream_callback,
+            }}
 
             await log_callback("System", "info", "Starting agentic investigation graph...")
             result_state = await graph.ainvoke(initial_state, config=config)
             final_answer = result_state.get("final_answer", "Sorry, I was unable to complete the analysis.")
+
+            # Signal streaming is done
+            await websocket.send_json({"type": "stream_end"})
 
             # Persist assistant message
             await messages_col.insert_one({

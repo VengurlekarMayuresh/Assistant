@@ -122,12 +122,14 @@ export default function ArchitectureMap({ repoId, onNodeClick }) {
       </div>
       
       <TransformWrapper
-        initialScale={1}
-        minScale={0.1}
-        maxScale={4}
+        initialScale={0.85}
+        minScale={0.15}
+        maxScale={3}
         centerOnInit={true}
-        wheel={{ step: 0.05 }} // removed smoothStep as it can cause erratic scroll in some browsers
-        pinch={{ step: 5 }}
+        wheel={{ step: 0.015, smoothStep: 0.003 }}
+        pinch={{ step: 3 }}
+        doubleClick={{ disabled: true }}
+        velocityAnimation={{ sensitivity: 1, animationTime: 200 }}
       >
         {({ zoomIn, zoomOut, resetTransform }) => (
           <>

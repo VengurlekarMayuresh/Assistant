@@ -408,7 +408,7 @@ async def explorer_node(state: AgentState, config: RunnableConfig | None = None)
     }
 
 
-# ── Node 3: Synthesizer (with background prefetch) ─────────────────────────
+# ── Node 3: Synthesizer (with streaming + background prefetch) ──────────────
 
 async def synthesizer_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
     query = state["query"]
@@ -421,6 +421,8 @@ async def synthesizer_node(state: AgentState, config: RunnableConfig | None = No
     repo_id = state.get("repo_id", "")
 
     callback = (config or {}).get("configurable", {}).get("log_callback")
+    stream_callback = (config or {}).get("configurable", {}).get("stream_callback")
+
     if callback:
         await callback("Synthesizer", "info", "Synthesizing final response...")
 
@@ -442,13 +444,47 @@ async def synthesizer_node(state: AgentState, config: RunnableConfig | None = No
         findings_context += f"--- FILE: {path} ---\n{content[:6000]}\n\n"
 
     user_prompt = f"Query: {query}\n\nContext:\n{findings_context}\nGenerate the final response."
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
-    try:
-        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        final_answer = clean_llm_response_content(resp)
-    except Exception as e:
-        logger.error(f"Synthesizer error: {e}")
-        final_answer = f"Error generating response: {e}"
+    final_answer = ""
+
+    # ── Streaming path: send tokens one-by-one via stream_callback ──────
+    if stream_callback:
+        try:
+            async for chunk in llm.astream(messages):
+                token = ""
+                if hasattr(chunk, "content"):
+                    if isinstance(chunk.content, str):
+                        token = chunk.content
+                    elif isinstance(chunk.content, list):
+                        for part in chunk.content:
+                            if isinstance(part, str):
+                                token += part
+                            elif isinstance(part, dict) and "text" in part:
+                                token += part["text"]
+                if token:
+                    final_answer += token
+                    await stream_callback(token)
+        except Exception as e:
+            logger.error(f"Synthesizer streaming error: {e}")
+            if not final_answer:
+                # Fallback to non-streaming if astream failed completely
+                try:
+                    resp = await llm.ainvoke(messages)
+                    final_answer = clean_llm_response_content(resp)
+                except Exception as e2:
+                    logger.error(f"Synthesizer fallback error: {e2}")
+                    final_answer = f"Error generating response: {e2}"
+    else:
+        # ── Non-streaming fallback (e.g. for tests or non-WS usage) ────
+        try:
+            resp = await llm.ainvoke(messages)
+            final_answer = clean_llm_response_content(resp)
+        except Exception as e:
+            logger.error(f"Synthesizer error: {e}")
+            final_answer = f"Error generating response: {e}"
+
+    final_answer = final_answer.strip()
 
     if callback:
         await callback("Synthesizer", "completion", "Final answer compiled.")
