@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     LANGCHAIN_API_KEY: Optional[str] = None
     LANGCHAIN_PROJECT: str = "repomind-ai"
 
+    # ─── Redis Cache ──────────────────────────────────────────────────────────
+    REDIS_URL: str = "redis://localhost:6379/0"
+
     # ─── Server ───────────────────────────────────────────────────────────
     HOST: str = "0.0.0.0"
     PORT: int = 8000

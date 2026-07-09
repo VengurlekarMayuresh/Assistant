@@ -1,56 +1,72 @@
 """
 LangGraph Agent Graph — RepoMind AI.
 
-Multi-node agentic pipeline:
-  Planner → Explorer (loop) → Synthesizer
+Agentic RAG pipeline:
 
-Cache-first strategy:
-  1. Planner checks Qdrant semantic search for cached KO summaries.
-  2. If high-confidence hit → skip Explorer, go straight to Synthesizer.
-  3. Planner also queries Neo4j to expand file context via import graph.
-  4. Explorer checks MongoDB file cache before hitting GitHub.
-  5. Synthesizer spawns background prefetch task for follow-up files.
+  [query_rewriter] ──► [retriever] ──► [synthesizer] ──► (check_context)
+                             ▲                                    │
+                             │                          ┌─────────┴──────────┐
+                             │                       "research"           "end"
+                             │                    [research_node]           │
+                             └────────────────────────────┘               END
+
+Flow:
+  1. query_rewriter  — Expands the raw query using conversation history.
+  2. retriever       — Two-Stage fast pass OR direct load_file:<path> bypass.
+  3. synthesizer     — Strict prompt-cached generation with streaming.
+  4. check_context   — Routes to research_node on <MISSING_CONTEXT>, else END.
+  5. research_node   — Determines the best follow-up query; sets rewritten_query.
+                       Loops back to retriever (max MAX_RESEARCH_LOOPS = 3).
 """
-import json
-import logging
+
 import re
-import asyncio
-from typing import Dict, Any, List, Optional
-from typing_extensions import TypedDict
-from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.runnables import RunnableConfig
+from typing import Any, Dict, List, Optional
+
 from bson import ObjectId
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, StateGraph
+from typing_extensions import TypedDict
 
 from app.config import settings
-from app.services.github_service import GitHubService
 
-logger = logging.getLogger(__name__)
+MAX_RESEARCH_LOOPS = 3
 
 
-# ── State ──────────────────────────────────────────────────────────────────
+# ── AgentState ─────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
+    # Core query fields
     query: str
+    rewritten_query: str       # Also used as load_file:<path> signal for retriever
+
+    # Repository context (set by main.py before graph invocation)
     owner: str
     repo: str
     branch: str
-    file_list: List[str]
+    repo_id: str               # MongoDB repository _id string
+    file_list: List[str]       # Flat list of all repo file paths
     languages: Dict[str, Any]
     frameworks: List[str]
-    plan: List[str]
-    step_findings: List[str]
-    current_step_index: int
-    files_cache: Dict[str, str]
+
+    # Retrieval output — grows across research loop iterations
+    retrieved_context: List[Dict]   # [{path: str, content: str}, ...]
+
+    # Conversation state
+    chat_history: List[Any]         # [{role: str, content: str}, ...]
     session_id: str
+
+    # Research loop control
+    fallback_count: int
+
+    # Final output
     final_answer: str
-    repo_id: str          # MongoDB repository _id string
 
 
-# ── LLM factory ───────────────────────────────────────────────────────────
+# ── LLM Helpers ────────────────────────────────────────────────────────────
 
-def get_llm():
+def _get_llm() -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
         model=settings.GOOGLE_MODEL,
         google_api_key=settings.GOOGLE_API_KEY,
@@ -58,32 +74,25 @@ def get_llm():
     )
 
 
-def llm_content_text(content: Any) -> str:
-    if content is None:
-        return ""
+def _clean(response: Any) -> str:
+    """Extracts plain text from any LangChain response object."""
+    content = getattr(response, "content", response)
     if isinstance(content, str):
-        return content
+        return content.strip()
     if isinstance(content, list):
-        parts: List[str] = []
+        parts = []
         for item in content:
             if isinstance(item, str):
                 parts.append(item)
-                continue
-            if isinstance(item, dict):
-                text_value = item.get("text") or item.get("content") or item.get("value")
-                if isinstance(text_value, str):
-                    parts.append(text_value)
-                    continue
-            parts.append(str(item))
-        return "\n".join(parts)
-    return str(content)
+            elif isinstance(item, dict):
+                parts.append(item.get("text") or item.get("content") or str(item))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+    return str(content).strip()
 
 
-def clean_llm_response_content(response: Any) -> str:
-    return llm_content_text(getattr(response, "content", response)).strip()
-
-
-# ── File tree utilities ────────────────────────────────────────────────────
+# ── File Tree Utility ───────────────────────────────────────────────────────
 
 CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
@@ -93,499 +102,351 @@ CODE_EXTENSIONS = {
 }
 EXCLUDED_DIRS = {
     "node_modules", ".git", "__pycache__", ".venv", "venv",
-    "dist", "build", ".next", "vendor", "coverage",
+    "dist", "build", ".next", "vendor", "coverage", "bin", "obj",
+    "target", "out",
+}
+IGNORE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".pyc",
+    ".log", ".lock",
 }
 
 
-def prune_structure(tree_items: List[Dict], max_files: int = 120) -> List[str]:
-    """Filter tree to code-relevant files, returning a flat list of paths."""
+def prune_structure(tree_items: List[Dict], max_files: Optional[int] = 5000) -> List[str]:
+    """Filters a GitHub tree payload to a flat list of code-relevant file paths."""
     files = []
     for item in tree_items:
         if item.get("type") != "blob":
             continue
         path = item.get("path", "")
-        parts = path.split("/")
-        if any(part in EXCLUDED_DIRS for part in parts):
+        if any(part in EXCLUDED_DIRS for part in path.split("/")):
             continue
         ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in IGNORE_EXTS:
+            continue
         if ext in CODE_EXTENSIONS or path in {"Makefile", "Dockerfile", "Procfile"}:
             files.append(path)
-        if len(files) >= max_files:
+        if max_files and len(files) >= max_files:
             break
     return files
 
 
-# ── Node 1: Planner (Semantic-Search-First + Neo4j graph expansion) ────────
+# ── Node 1: Query Rewriter ─────────────────────────────────────────────────
 
-async def planner_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
-    query = state["query"]
-    file_list = state["file_list"]
-    languages = state["languages"]
-    frameworks = state["frameworks"]
-    repo_id = state.get("repo_id", "")
-
-    callback = (config or {}).get("configurable", {}).get("log_callback")
-
-    if callback:
-        await callback("Planner", "info", "Searching local Qdrant semantic cache...")
-
-    # ── 1. Qdrant semantic search ──────────────────────────────────────────
-    cached_files: List[dict] = []
-    cached_kos: List[dict] = []
-
-    if repo_id:
-        try:
-            from app.services.semantic_search import SemanticSearchService
-            search_svc = SemanticSearchService(repo_id)
-            cached_files, cached_kos = await search_svc.search_local_cache(query)
-        except Exception as e:
-            logger.error(f"Semantic search error: {e}")
-
-    # ── 2. If KO hits → ask LLM if we can answer from cache ───────────────
-    if cached_kos:
-        if callback:
-            await callback(
-                "Planner", "info",
-                f"Found {len(cached_kos)} matching Knowledge Object categories. Evaluating confidence..."
-            )
-
-        llm = get_llm()
-        kos_context = "\n\n".join([
-            f"### Category: {ko['category']} (Version {ko.get('version', 1)})\n{ko['summary']}"
-            for ko in cached_kos
-        ])
-
-        system_eval = (
-            "You are RepoMind AI Evaluator. Determine if the user's query can be answered fully "
-            "based ONLY on the provided Knowledge Object summaries. Respond in raw JSON:\n"
-            '{"can_answer": true/false, "explanation": "why or why not", "confidence": 0.0-1.0}\n'
-            "Set can_answer=true when confidence >= 0.75."
-        )
-        user_eval = f"Query: {query}\n\nCache Summaries:\n{kos_context}"
-
-        try:
-            resp = await llm.ainvoke([SystemMessage(content=system_eval), HumanMessage(content=user_eval)])
-            cleaned = clean_llm_response_content(resp)
-            if "```json" in cleaned:
-                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-            elif "```" in cleaned:
-                cleaned = cleaned.split("```")[1].split("```")[0].strip()
-
-            eval_data = json.loads(cleaned)
-            if eval_data.get("can_answer") and eval_data.get("confidence", 0) >= 0.75:
-                if callback:
-                    await callback(
-                        "Planner", "info",
-                        f"Cache HIT (confidence={eval_data['confidence']}). Answering from local DB.",
-                        {"explanation": eval_data.get("explanation")},
-                    )
-                return {
-                    "plan": ["Resolve from local Knowledge Object cache."],
-                    "step_findings": [f"Cached Knowledge Summaries:\n{kos_context}"],
-                    "current_step_index": 1,
-                }
-        except Exception as e:
-            logger.error(f"Cache evaluator failed: {e}")
-
-    # ── 3. Neo4j graph expansion — expand seed files from semantic search ──
-    graph_related_files: List[str] = []
-    if repo_id and cached_files:
-        try:
-            from app.db.neo4j_client import get_related_files_for_query
-            seed_paths = [f["path"] for f in cached_files]
-            graph_related_files = await get_related_files_for_query(repo_id, seed_paths, depth=1)
-            graph_related_files = [p for p in graph_related_files if p not in seed_paths]
-            if graph_related_files and callback:
-                await callback(
-                    "Planner", "info",
-                    f"Neo4j graph expanded context by {len(graph_related_files)} related files.",
-                    {"related_files": graph_related_files[:10]},
-                )
-        except Exception as e:
-            logger.error(f"Neo4j graph expansion error: {e}")
-
-    # ── 4. Cache miss → generate step-by-step fetch plan ──────────────────
-    if callback:
-        await callback("Planner", "info", "Cache miss. Generating investigation plan...")
-
-    # Combine file list with Neo4j expanded context
-    enhanced_file_list = list(dict.fromkeys(file_list + graph_related_files))
-
-    llm = get_llm()
+async def query_rewriter_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+    """
+    Expands the raw user query into a richer semantic search string,
+    using the conversation history to resolve pronouns and infer intent.
+    """
+    history_text = "\n".join(
+        f"{m['role']}: {m['content']}" for m in state.get("chat_history", [])
+    )
     system_prompt = (
-        "You are RepoMind AI Planner, a senior software architect. "
-        "Create a focused checklist of 2-4 concrete steps to answer the user's query. "
-        "Steps should target specific files or directories in the codebase. "
-        "Return a valid JSON array of strings. No markdown or conversational text."
+        "You are RepoMind AI Query Rewriter. Expand the user's technical question "
+        "for semantic vector retrieval. Use the conversation history to resolve "
+        "pronouns and infer missing context. Add technical synonyms and richer terms.\n"
+        "Return ONLY the rewritten query string. No markdown, quotes, or explanations."
     )
-    user_prompt = (
-        f"User Query: {query}\n"
-        f"Languages: {list(languages.keys())}\n"
-        f"Frameworks: {frameworks}\n"
-        f"Key Files:\n" + "\n".join(enhanced_file_list[:120])
-    )
+    user_payload = f"Conversation History:\n{history_text}\n\nOriginal Query: {state['query']}"
 
     try:
-        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        cleaned = clean_llm_response_content(resp)
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0].strip()
-        plan = json.loads(cleaned)
-        if not isinstance(plan, list):
-            plan = [plan]
-    except Exception as e:
-        logger.error(f"Planner LLM error: {e}")
-        plan = [
-            f"Locate files related to: {query}",
-            "Examine implementation details",
-            "Synthesize results",
-        ]
+        llm = _get_llm()
+        resp = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_payload),
+        ])
+        rewritten_query = _clean(resp)
+    except Exception:
+        rewritten_query = state["query"]
 
-    if callback:
-        await callback("Planner", "plan", "Investigation plan generated.", {"plan": plan})
-
-    return {
-        "plan": plan,
-        "step_findings": [""] * len(plan),
-        "current_step_index": 0,
-    }
+    return {"rewritten_query": rewritten_query}
 
 
-# ── Node 2: Explorer (MongoDB cache-first + dynamic context expansion) ─────
+# ── Node 2: Retriever ─────────────────────────────────────────────────────
 
-async def explorer_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
-    query = state["query"]
-    plan = list(state["plan"])
-    current_index = state["current_step_index"]
+async def retriever_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+    """
+    Retrieves files for the synthesizer. Two operating modes:
+
+    Mode A — Direct Load (load_file:<path>):
+        Triggered when rewritten_query starts with 'load_file:'.
+        Bypasses Qdrant entirely and does a single MongoDB find_one by path.
+        Appends to the existing retrieved_context (does not replace it).
+
+    Mode B — Two-Stage Fast Pass (default):
+        Runs the full TwoStageRetriever pipeline:
+          Stage 1: Qdrant global seed (top_k=8).
+          Stage 2: Regex import extraction → MongoDB $in bulk fetch.
+        Existing retrieved_context paths are passed as exclude_paths
+        to avoid re-fetching files already in context.
+    """
+    rewritten_query = state.get("rewritten_query") or state["query"]
+    repo_id = state.get("repo_id", "")
     file_list = state["file_list"]
-    files_cache = state["files_cache"] or {}
-    step_findings = list(state["step_findings"])
+    current_context = list(state.get("retrieved_context", []))
+    existing_paths = {f["path"] for f in current_context}
+
+    # ── Mode A: Direct file load ───────────────────────────────────────────
+    if rewritten_query.startswith("load_file:"):
+        file_path = rewritten_query[len("load_file:"):].strip()
+
+        # Skip if already in context
+        if file_path in existing_paths:
+            return {"retrieved_context": current_context}
+
+        try:
+            from app.db.mongo import get_collection
+            files_col = get_collection("repository_files")
+            doc = await files_col.find_one({
+                "repository_id": repo_id,
+                "path": file_path,
+            })
+            if doc:
+                current_context.append({
+                    "path": doc["path"],
+                    "content": doc.get("content", ""),
+                })
+        except Exception:
+            pass
+
+        return {"retrieved_context": current_context}
+
+    # ── Mode B: Two-Stage fast pass ────────────────────────────────────────
+    from app.services.two_stage_retriever import TwoStageRetriever
+
+    retriever = TwoStageRetriever(
+        repo_id=repo_id,
+        file_list=file_list,
+        exclude_paths=existing_paths,
+    )
+    new_files = await retriever.retrieve(rewritten_query, top_k=8)
+    merged = current_context + new_files
+
+    return {"retrieved_context": merged}
+
+
+# ── Node 3: Synthesizer ────────────────────────────────────────────────────
+
+async def synthesizer_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+    """
+    Generates the final answer using a strict prompt-cache-optimal layout:
+
+      [1] System Instructions             (static)
+      [2] <codebase> XML block            (static across follow-up turns)
+      [3] <chat_history> sliding window   (last 3 turns)
+      [4] <query> current question        (dynamic)
+
+    Streams tokens via stream_callback if provided.
+    Signals missing context by outputting ONLY:
+      <MISSING_CONTEXT>exact_file_path_or_entity</MISSING_CONTEXT>
+    """
+    query = state["query"]
+    retrieved_context = state.get("retrieved_context", [])
+    chat_history = state.get("chat_history", [])
     owner = state["owner"]
     repo = state["repo"]
-    branch = state["branch"]
-    repo_id = state.get("repo_id", "")
 
-    callback = (config or {}).get("configurable", {}).get("log_callback")
-
-    if current_index >= len(plan):
-        return {}
-
-    current_step = plan[current_index]
-    if callback:
-        await callback("Explorer", "info", f"Step {current_index + 1}/{len(plan)}: '{current_step}'")
-
-    # ── Identify file to read ──────────────────────────────────────────────
-    llm = get_llm()
-    system_prompt = (
-        "You are RepoMind AI Explorer investigating a codebase.\n"
-        f"Goal: {query}\n"
-        f"Current Step: {current_step}\n"
-        f"Files already read: {list(files_cache.keys())}\n\n"
-        "Identify which file path from the repository list must be read to complete this step.\n"
-        "If you already have enough information, specify 'NONE'.\n"
-        'Output raw JSON: {"file_to_read": "path/to/file" or "NONE", "reason": "..."}'
-    )
-    user_prompt = "Available Files:\n" + "\n".join(file_list[:120])
-
-    file_to_read = "NONE"
-    try:
-        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        cleaned = clean_llm_response_content(resp)
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0].strip()
-        data = json.loads(cleaned)
-        file_to_read = data.get("file_to_read", "NONE").strip()
-    except Exception as e:
-        logger.error(f"Explorer file selection error: {e}")
-
-    content = ""
-    if file_to_read != "NONE" and file_to_read in file_list:
-        if file_to_read not in files_cache:
-            # 1. Check MongoDB cache
-            mongo_content = None
-            if repo_id:
-                try:
-                    from app.db.mongo import get_collection
-                    files_col = get_collection("repository_files")
-                    doc = await files_col.find_one({
-                        "repository_id": repo_id,
-                        "path": file_to_read,
-                    })
-                    if doc:
-                        mongo_content = doc["content"]
-                except Exception as e:
-                    logger.error(f"MongoDB file lookup error: {e}")
-
-            if mongo_content:
-                if callback:
-                    await callback("Explorer", "info", f"MongoDB cache hit: '{file_to_read}'")
-                content = mongo_content
-                files_cache[file_to_read] = content
-            else:
-                # 2. Fallback: fetch from GitHub
-                if callback:
-                    await callback("Explorer", "tool_call", f"Cache miss. Fetching '{file_to_read}' from GitHub...", {"path": file_to_read})
-                try:
-                    gh = GitHubService()
-                    content = await gh.fetch_file_content(owner, repo, file_to_read, branch)
-                    files_cache[file_to_read] = content
-
-                    # Persist to MongoDB + Qdrant
-                    if repo_id:
-                        from app.db.mongo import get_collection
-                        from app.db.qdrant_client import upsert_file_vector
-                        files_col = get_collection("repository_files")
-                        result = await files_col.insert_one({
-                            "repository_id": repo_id,
-                            "path": file_to_read,
-                            "content": content,
-                            "last_updated": __import__("datetime").datetime.utcnow(),
-                        })
-                        await upsert_file_vector(
-                            str(result.inserted_id), repo_id, file_to_read, content[:500]
-                        )
-                except Exception as e:
-                    logger.error(f"GitHub fetch failed for {file_to_read}: {e}")
-                    content = f"Error fetching file: {e}"
-                    files_cache[file_to_read] = content
-        else:
-            content = files_cache[file_to_read]
-
-    # ── Analyze findings + dynamic import expansion ────────────────────────
-    system_analyzer = (
-        "You are RepoMind AI Explorer. Analyze file content to resolve the plan step.\n"
-        f"Goal: {query}\n"
-        f"Step: {current_step}\n"
-        "Synthesize what you learned. Also suggest 0-3 additional import files to inspect if needed.\n"
-        'Output raw JSON: {"findings": "...", "additional_imports_to_inspect": ["path/to/file"]}'
-    )
-    analyzer_input = f"File: {file_to_read}\nContent:\n{content[:12000] if content else 'No content.'}"
-
-    step_result = ""
-    try:
-        analyzer_resp = await llm.ainvoke([
-            SystemMessage(content=system_analyzer),
-            HumanMessage(content=analyzer_input),
-        ])
-        cleaned = clean_llm_response_content(analyzer_resp)
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0].strip()
-
-        analysis_data = json.loads(cleaned)
-        step_result = analysis_data.get("findings", "")
-
-        # Inject import dependencies into the plan
-        additional_imports = analysis_data.get("additional_imports_to_inspect", [])
-        valid_imports = [imp for imp in additional_imports if imp in file_list and imp not in files_cache]
-        if valid_imports and callback:
-            await callback(
-                "Explorer", "info",
-                f"Dynamic expansion: adding {valid_imports} to plan."
-            )
-        for imp_path in valid_imports:
-            plan.insert(current_index + 1, f"Inspect dependency: '{imp_path}'")
-            step_findings.insert(current_index + 1, "")
-
-    except Exception as e:
-        logger.error(f"Explorer analysis error: {e}")
-        step_result = f"Unable to fully analyze {file_to_read}."
-
-    step_findings[current_index] = step_result
-    if callback:
-        await callback("Explorer", "info", f"Step {current_index + 1} complete.")
-
-    return {
-        "plan": plan,
-        "files_cache": files_cache,
-        "step_findings": step_findings,
-        "current_step_index": current_index + 1,
-    }
-
-
-# ── Node 3: Synthesizer (with streaming + background prefetch) ──────────────
-
-async def synthesizer_node(state: AgentState, config: RunnableConfig | None = None) -> Dict[str, Any]:
-    query = state["query"]
-    plan = state["plan"]
-    step_findings = state["step_findings"]
-    files_cache = state["files_cache"] or {}
-    owner = state["owner"]
-    repo = state["repo"]
-    file_list = state["file_list"]
-    repo_id = state.get("repo_id", "")
-
-    callback = (config or {}).get("configurable", {}).get("log_callback")
     stream_callback = (config or {}).get("configurable", {}).get("stream_callback")
 
-    if callback:
-        await callback("Synthesizer", "info", "Synthesizing final response...")
-
-    llm = get_llm()
+    # ── 1. System Prompt ───────────────────────────────────────────────────
     system_prompt = (
-        "You are RepoMind AI Synthesizer, a principal software engineer. "
-        f"Answer the user query based on a detailed investigation of `{owner}/{repo}`.\n\n"
-        "Provide a comprehensive technical response in Markdown. "
-        "Cite specific files, classes, and code structures. Use structured headers and code blocks."
+        "You are RepoMind AI Synthesizer, a principal software engineer.\n"
+        f"You are analyzing the repository `{owner}/{repo}`.\n\n"
+        "Rules:\n"
+        "- Answer in clean, well-structured Markdown.\n"
+        "- Cite specific file paths, class names, and function names.\n"
+        "- Use fenced code blocks with language tags for all code.\n"
+        "- If you cannot answer because a critical file or function definition "
+        "is missing from your context, output ONLY this tag and nothing else:\n"
+        "  <MISSING_CONTEXT>exact_file_path_or_function_name</MISSING_CONTEXT>\n"
+        "- Do NOT guess or hallucinate file contents. Use only what is provided."
     )
 
-    findings_context = "Investigation Plan & Findings:\n"
-    for i, step in enumerate(plan):
-        findings_context += f"Step {i+1}: {step}\n"
-        findings_context += f"Findings: {step_findings[i] if i < len(step_findings) else 'N/A'}\n\n"
+    # ── 2. Codebase XML Block ──────────────────────────────────────────────
+    codebase_lines = ["<codebase>"]
+    for f in retrieved_context:
+        codebase_lines.append(f'<file path="{f.get("path", "unknown")}">')
+        codebase_lines.append(f.get("content", "")[:10_000])
+        codebase_lines.append("</file>")
+    codebase_lines.append("</codebase>")
+    codebase_str = "\n".join(codebase_lines)
 
-    findings_context += "Code Snippets:\n"
-    for path, content in files_cache.items():
-        findings_context += f"--- FILE: {path} ---\n{content[:6000]}\n\n"
+    # ── 3. Truncated Chat History ──────────────────────────────────────────
+    from app.services.two_stage_retriever import truncate_chat_history
+    recent = truncate_chat_history(chat_history, retain_turns=3)
+    history_str = "\n".join(
+        f'<turn role="{t.get("role")}">{t.get("content")}</turn>' for t in recent
+    ) or "(no prior conversation)"
 
-    user_prompt = f"Query: {query}\n\nContext:\n{findings_context}\nGenerate the final response."
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+    # ── 4. User Prompt ─────────────────────────────────────────────────────
+    user_prompt = (
+        f"{codebase_str}\n\n"
+        f"<chat_history>\n{history_str}\n</chat_history>\n\n"
+        f"<query>{query}</query>"
+    )
 
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+
+    llm = _get_llm()
     final_answer = ""
 
-    # ── Streaming path: send tokens one-by-one via stream_callback ──────
     if stream_callback:
         try:
             async for chunk in llm.astream(messages):
                 token = ""
-                if hasattr(chunk, "content"):
-                    if isinstance(chunk.content, str):
-                        token = chunk.content
-                    elif isinstance(chunk.content, list):
-                        for part in chunk.content:
-                            if isinstance(part, str):
-                                token += part
-                            elif isinstance(part, dict) and "text" in part:
-                                token += part["text"]
+                c = getattr(chunk, "content", "")
+                if isinstance(c, str):
+                    token = c
+                elif isinstance(c, list):
+                    for part in c:
+                        if isinstance(part, str):
+                            token += part
+                        elif isinstance(part, dict) and "text" in part:
+                            token += part["text"]
                 if token:
                     final_answer += token
                     await stream_callback(token)
-        except Exception as e:
-            logger.error(f"Synthesizer streaming error: {e}")
+        except Exception:
             if not final_answer:
-                # Fallback to non-streaming if astream failed completely
                 try:
                     resp = await llm.ainvoke(messages)
-                    final_answer = clean_llm_response_content(resp)
-                except Exception as e2:
-                    logger.error(f"Synthesizer fallback error: {e2}")
-                    final_answer = f"Error generating response: {e2}"
+                    final_answer = _clean(resp)
+                except Exception as e:
+                    final_answer = f"Error generating response: {e}"
     else:
-        # ── Non-streaming fallback (e.g. for tests or non-WS usage) ────
         try:
             resp = await llm.ainvoke(messages)
-            final_answer = clean_llm_response_content(resp)
+            final_answer = _clean(resp)
         except Exception as e:
-            logger.error(f"Synthesizer error: {e}")
             final_answer = f"Error generating response: {e}"
 
-    final_answer = final_answer.strip()
-
-    if callback:
-        await callback("Synthesizer", "completion", "Final answer compiled.")
-
-    # Background prefetch
-    if repo_id:
-        asyncio.create_task(
-            run_prefetching(query, final_answer, file_list, owner, repo, repo_id, callback)
-        )
-
-    return {"final_answer": final_answer}
+    return {"final_answer": final_answer.strip()}
 
 
-async def run_prefetching(
-    query: str,
-    answer: str,
-    file_list: List[str],
-    owner: str,
-    repo_name: str,
-    repo_id: str,
-    callback: Optional[Any],
-):
+# ── Node 4: Research Node ──────────────────────────────────────────────────
+
+async def research_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
     """
-    Background task: predict follow-up files and pre-cache them
-    in MongoDB + Qdrant so the next query is faster.
+    Agentic research step triggered when the Synthesizer signals missing context.
+
+    Behaviour:
+      1. Parse the <MISSING_CONTEXT> tag from final_answer.
+      2. If the entity looks like a file path (contains '/' or ends in a known
+         extension), set rewritten_query = 'load_file:<path>' for a direct
+         MongoDB fetch in the next retriever pass.
+      3. If the entity is a concept/function name, use the LLM to generate a
+         sharper vector search query that maximises the chance of locating
+         the missing file in Qdrant.
+
+    Always increments fallback_count.
     """
-    try:
-        llm = get_llm()
+    raw_answer = state.get("final_answer", "")
+    query = state["query"]
+
+    match = re.search(r"<MISSING_CONTEXT>(.*?)</MISSING_CONTEXT>", raw_answer, re.DOTALL)
+    missing_entity = match.group(1).strip() if match else raw_answer.strip()
+
+    # ── Heuristic: does this look like a file path? ────────────────────────
+    file_extensions = (
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
+        ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".swift", ".kt",
+        ".json", ".yaml", ".yml", ".toml", ".md", ".html", ".css",
+    )
+    is_file_path = (
+        "/" in missing_entity
+        or missing_entity.endswith(file_extensions)
+    )
+
+    if is_file_path:
+        new_query = f"load_file:{missing_entity}"
+    else:
+        # Ask the LLM to generate a better semantic search query
         system_prompt = (
-            "You are RepoMind AI Prefetcher. Given a query and its answer, predict 1-3 files "
-            "the user is likely to ask about next. Return a raw JSON array of file paths only."
+            "You are a code search query optimizer. "
+            "Given an original user question and a missing entity that prevented answering, "
+            "generate the single best vector search query to locate the file or code "
+            "that defines or implements that entity.\n"
+            "Return ONLY the search query string. No markdown, quotes, or explanation."
         )
-        user_prompt = (
-            f"Query: {query}\nAnswer: {answer[:4000]}\n\nAvailable files:\n"
-            + "\n".join(file_list[:100])
+        user_payload = (
+            f"Original user question: {query}\n"
+            f"Missing entity: {missing_entity}\n\n"
+            "Generate a targeted search query to find the file containing this entity."
         )
+        try:
+            llm = _get_llm()
+            resp = await llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_payload),
+            ])
+            new_query = _clean(resp)
+        except Exception:
+            new_query = missing_entity
 
-        resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        cleaned = clean_llm_response_content(resp)
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0].strip()
-
-        prefetch_paths = json.loads(cleaned)
-        if not isinstance(prefetch_paths, list):
-            return
-
-        valid_paths = [p for p in prefetch_paths if p in file_list]
-        if not valid_paths:
-            return
-
-        if callback:
-            await callback("Prefetcher", "info", f"Background prefetching: {valid_paths}")
-
-        from app.db.mongo import get_collection
-        from app.db.qdrant_client import upsert_file_vector
-        files_col = get_collection("repository_files")
-        gh = GitHubService()
-
-        for path in valid_paths:
-            existing = await files_col.find_one({"repository_id": repo_id, "path": path})
-            if existing:
-                continue
-            try:
-                content = await gh.fetch_file_content(owner, repo_name, path)
-                result = await files_col.insert_one({
-                    "repository_id": repo_id,
-                    "path": path,
-                    "content": content,
-                    "last_updated": __import__("datetime").datetime.utcnow(),
-                })
-                await upsert_file_vector(str(result.inserted_id), repo_id, path, content[:500])
-            except Exception as e:
-                logger.error(f"Prefetch download failed for {path}: {e}")
-
-    except Exception as e:
-        logger.error(f"Prefetching task error: {e}")
+    return {
+        "rewritten_query": new_query,
+        "fallback_count": state.get("fallback_count", 0) + 1,
+    }
 
 
-# ── Routing ────────────────────────────────────────────────────────────────
+# ── Conditional Edge ────────────────────────────────────────────────────────
 
-def should_continue(state: AgentState) -> str:
-    if state["current_step_index"] < len(state["plan"]):
-        return "explorer"
-    return "synthesizer"
+def check_context(state: AgentState) -> str:
+    """
+    Routes the graph after the Synthesizer:
+      "research" → <MISSING_CONTEXT> detected AND fallback_count < MAX_RESEARCH_LOOPS
+      "end"      → answer is complete OR research loop cap reached
+    """
+    final_answer = state.get("final_answer", "")
+    fallback_count = state.get("fallback_count", 0)
 
+    if "<MISSING_CONTEXT>" in final_answer and fallback_count < MAX_RESEARCH_LOOPS:
+        return "research"
+
+    return "end"
+
+
+# ── Graph Builder ───────────────────────────────────────────────────────────
 
 def build_agent_graph():
+    """
+    Assembles and compiles the RepoMind AI LangGraph pipeline.
+
+    Flow:
+        [query_rewriter] ──► [retriever] ──► [synthesizer] ──► (check_context)
+                                  ▲                                    │
+                                  │                          ┌─────────┴──────────┐
+                                  │                       "research"           "end"
+                                  │                    [research_node]           │
+                                  └────────────────────────────┘               END
+    """
     workflow = StateGraph(AgentState)
-    workflow.add_node("planner", planner_node)
-    workflow.add_node("explorer", explorer_node)
+
+    workflow.add_node("query_rewriter", query_rewriter_node)
+    workflow.add_node("retriever", retriever_node)
     workflow.add_node("synthesizer", synthesizer_node)
-    workflow.set_entry_point("planner")
-    workflow.add_conditional_edges("planner", should_continue, {
-        "explorer": "explorer",
-        "synthesizer": "synthesizer",
-    })
-    workflow.add_conditional_edges("explorer", should_continue, {
-        "explorer": "explorer",
-        "synthesizer": "synthesizer",
-    })
-    workflow.add_edge("synthesizer", END)
+    workflow.add_node("research", research_node)
+
+    workflow.set_entry_point("query_rewriter")
+    workflow.add_edge("query_rewriter", "retriever")
+    workflow.add_edge("retriever", "synthesizer")
+
+    workflow.add_conditional_edges(
+        "synthesizer",
+        check_context,
+        {
+            "research": "research",
+            "end": END,
+        },
+    )
+
+    # Research loops back to retriever with updated rewritten_query
+    workflow.add_edge("research", "retriever")
+
     return workflow.compile()

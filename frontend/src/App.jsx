@@ -172,12 +172,14 @@ export default function App() {
       <main className="flex-1 flex flex-col min-h-0">
         {!activeRepo ? (
           // Home Dashboard view
-          <RepoGrid
-            repos={repos}
-            onSelectRepo={handleSelectRepo}
-            onAddRepo={handleAddRepo}
-            isLoading={isLoadingRepos}
-          />
+          <div className="flex-1 overflow-y-auto">
+            <RepoGrid
+              repos={repos}
+              onSelectRepo={handleSelectRepo}
+              onAddRepo={handleAddRepo}
+              isLoading={isLoadingRepos}
+            />
+          </div>
         ) : (
           // Exploration Workspace view (split view)
           <div className="flex-1 flex flex-col md:flex-row min-h-0 overflow-hidden">

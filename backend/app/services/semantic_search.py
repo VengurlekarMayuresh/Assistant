@@ -12,7 +12,7 @@ Flow:
   5. Return (files, knowledge_objects) for the planner node to evaluate.
 """
 import logging
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 from app.db.mongo import get_collection
 from app.db.qdrant_client import (
@@ -45,6 +45,7 @@ class SemanticSearchService:
         ko_top_k: int = 5,
         file_top_k: int = 8,
         score_threshold: float = 0.30,
+        file_filter_list: Optional[List[str]] = None,
     ) -> Tuple[List[Dict], List[Dict]]:
         """
         Semantic search over locally cached Knowledge Objects and Repository Files.
@@ -83,19 +84,35 @@ class SemanticSearchService:
         )
 
         # ── 2. Search Repository Files ────────────────────────────────────
-        file_hits = await search_repository_files(
-            query=query,
-            repository_id=self.repository_id,
-            top_k=file_top_k,
+        from app.db.qdrant_client import get_qdrant_client, COLLECTION_FILES, embed_text
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
+
+        qdrant = get_qdrant_client()
+        vector = embed_text(query)
+        
+        must_conditions = [FieldCondition(key="repository_id", match=MatchValue(value=self.repository_id))]
+        if file_filter_list is not None:
+            must_conditions.append(FieldCondition(key="path", match=MatchAny(any=file_filter_list)))
+
+        file_hits = await qdrant.query_points(
+            collection_name=COLLECTION_FILES,
+            query=vector,
+            query_filter=Filter(must=must_conditions),
+            limit=file_top_k * 3, # fetch more chunks since we deduplicate by file
+            with_payload=True,
         )
 
         matching_files = []
+        seen_mongo_ids = set()
+        
         for hit in file_hits:
             if hit.score < score_threshold:
                 continue
             mongo_id = hit.payload.get("mongo_id")
-            if not mongo_id:
+            if not mongo_id or mongo_id in seen_mongo_ids:
                 continue
+                
+            seen_mongo_ids.add(mongo_id)
             try:
                 files_col = get_collection("repository_files")
                 doc = await files_col.find_one({"_id": ObjectId(mongo_id)})

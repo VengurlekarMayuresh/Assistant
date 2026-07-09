@@ -35,6 +35,7 @@ _embedder: SentenceTransformer | None = None
 # Qdrant collection names
 COLLECTION_KNOWLEDGE = "knowledge_objects"
 COLLECTION_FILES = "repository_files"
+COLLECTION_MODULES = "repository_modules"
 
 # Embedding vector size for all-MiniLM-L6-v2
 VECTOR_SIZE = 384
@@ -114,6 +115,16 @@ async def init_qdrant_collections():
     else:
         logger.info(f"Qdrant collection '{COLLECTION_FILES}' already exists.")
 
+    # Create repository_modules collection if missing
+    if COLLECTION_MODULES not in existing_names:
+        await _qdrant_client.create_collection(
+            collection_name=COLLECTION_MODULES,
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        )
+        logger.info(f"Qdrant collection '{COLLECTION_MODULES}' created.")
+    else:
+        logger.info(f"Qdrant collection '{COLLECTION_MODULES}' already exists.")
+
     logger.info("Qdrant Cloud initialization complete.")
 
 
@@ -146,39 +157,93 @@ async def upsert_knowledge_object_vector(
     )
 
 
-async def upsert_file_vector(
-    point_id: str,
+async def upsert_module_vector(
+    module_id: str,
     repository_id: str,
-    path: str,
-    content_snippet: str,
+    module_name: str,
+    description: str,
+    files: List[str],
 ):
-    """Upsert a RepositoryFile embedding into Qdrant."""
+    """Upsert a Repository Map module embedding into Qdrant."""
     client = get_qdrant_client()
-    text = f"{path}\n{content_snippet[:500]}"
+    text = f"Module: {module_name}\nDescription: {description}"
     vector = embed_text(text)
 
     await client.upsert(
-        collection_name=COLLECTION_FILES,
+        collection_name=COLLECTION_MODULES,
         points=[
             PointStruct(
-                id=_str_to_int_id(point_id),
+                id=_str_to_int_id(module_id),
                 vector=vector,
                 payload={
-                    "mongo_id": point_id,
+                    "mongo_id": module_id,
                     "repository_id": repository_id,
-                    "path": path,
+                    "module_name": module_name,
+                    "files": files,
                 },
             )
         ],
     )
 
 
-async def delete_file_vector(point_id: str):
-    """Remove a file vector from Qdrant when the file is deleted from the repo."""
+async def upsert_file_chunks(
+    mongo_id: str,
+    repository_id: str,
+    path: str,
+    chunks: List[str],
+):
+    """Upsert multiple embedding chunks for a single RepositoryFile into Qdrant."""
+    if not chunks:
+        return
+        
+    client = get_qdrant_client()
+    
+    # Prefix chunks with file path so the vector carries context
+    texts_to_embed = [f"{path}\n{chunk}" for chunk in chunks]
+    vectors = embed_texts(texts_to_embed)
+
+    points = []
+    for i, (chunk_text, vector) in enumerate(zip(chunks, vectors)):
+        # Generate stable ID for this specific chunk
+        chunk_id_str = f"{mongo_id}_chunk_{i}"
+        points.append(
+            PointStruct(
+                id=_str_to_int_id(chunk_id_str),
+                vector=vector,
+                payload={
+                    "mongo_id": mongo_id,
+                    "repository_id": repository_id,
+                    "path": path,
+                    "chunk_index": i,
+                },
+            )
+        )
+
+    await client.upsert(
+        collection_name=COLLECTION_FILES,
+        points=points,
+    )
+
+
+async def delete_file_vector(mongo_id: str):
+    """Remove all file chunks from Qdrant when the file is deleted from the repo."""
     client = get_qdrant_client()
     await client.delete(
         collection_name=COLLECTION_FILES,
-        points_selector=[_str_to_int_id(point_id)],
+        points_selector=Filter(
+            must=[FieldCondition(key="mongo_id", match=MatchValue(value=mongo_id))]
+        ),
+    )
+
+
+async def delete_repository_modules(repository_id: str):
+    """Remove all module vectors for a repository."""
+    client = get_qdrant_client()
+    await client.delete(
+        collection_name=COLLECTION_MODULES,
+        points_selector=Filter(
+            must=[FieldCondition(key="repository_id", match=MatchValue(value=repository_id))]
+        ),
     )
 
 
@@ -214,6 +279,27 @@ async def search_repository_files(
 
     results = await client.query_points(
         collection_name=COLLECTION_FILES,
+        query=vector,
+        query_filter=Filter(
+            must=[FieldCondition(key="repository_id", match=MatchValue(value=repository_id))]
+        ),
+        limit=top_k,
+        with_payload=True,
+    )
+    return results.points
+
+
+async def search_repository_modules(
+    query: str,
+    repository_id: str,
+    top_k: int = 2,
+) -> List[ScoredPoint]:
+    """Semantic search over high-level repository modules."""
+    client = get_qdrant_client()
+    vector = embed_text(query)
+
+    results = await client.query_points(
+        collection_name=COLLECTION_MODULES,
         query=vector,
         query_filter=Filter(
             must=[FieldCondition(key="repository_id", match=MatchValue(value=repository_id))]

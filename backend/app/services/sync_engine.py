@@ -16,12 +16,23 @@ from typing import Dict, Any, List, Tuple, Optional
 from bson import ObjectId
 
 from app.db.mongo import get_collection
-from app.db.qdrant_client import upsert_file_vector, delete_file_vector
+from app.db.qdrant_client import upsert_file_chunks, delete_file_vector, upsert_module_vector, delete_repository_modules
 from app.services.github_service import GitHubService
 from app.agents.agent_graph import prune_structure
 
 logger = logging.getLogger(__name__)
 
+def chunk_text(text: str, chunk_size: int = 1500, overlap: int = 300) -> List[str]:
+    """Split text into overlapping chunks."""
+    chunks = []
+    if not text:
+        return chunks
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
 
 class SyncEngine:
     def __init__(self, repository_id: str):
@@ -146,8 +157,8 @@ class SyncEngine:
             }},
         )
 
-        # 4. Identify key files to cache
-        key_files = prune_structure(tree_items, max_files=150)
+        # 4. Identify key files to cache (unrestricted limit)
+        key_files = prune_structure(tree_items, max_files=None)
 
         # 5. Clear old cached files
         await self.files_col.delete_many({"repository_id": self.repository_id})
@@ -170,16 +181,17 @@ class SyncEngine:
                 })
                 file_id = str(result.inserted_id)
 
-                # Upsert Qdrant file vector
+                # Upsert Qdrant file chunks
                 try:
-                    await upsert_file_vector(
-                        point_id=file_id,
+                    chunks = chunk_text(content)
+                    await upsert_file_chunks(
+                        mongo_id=file_id,
                         repository_id=self.repository_id,
                         path=file_path,
-                        content_snippet=content[:500],
+                        chunks=chunks,
                     )
                 except Exception as e:
-                    logger.error(f"Qdrant file vector upsert failed for {file_path}: {e}")
+                    logger.error(f"Qdrant file chunk upsert failed for {file_path}: {e}")
 
             except Exception as e:
                 logger.error(f"Error caching {file_path}: {e}")
@@ -197,6 +209,69 @@ class SyncEngine:
         if log_callback:
             await log_callback("System", "info", "Building file dependency graph in Neo4j...")
         await ge.build_full_graph(log_callback)
+
+        # 9. Generate and store Repository Map
+        if log_callback:
+            await log_callback("System", "info", "Generating structured Repository Map...")
+        await self._generate_repository_map(key_files, log_callback)
+
+    async def _generate_repository_map(self, file_paths: List[str], log_callback: Optional[Any] = None):
+        """Use LLM to categorize files into a structured Repository Map JSON."""
+        try:
+            from app.agents.agent_graph import get_llm, clean_llm_response_content
+            from langchain_core.messages import SystemMessage, HumanMessage
+            import json
+            
+            llm = get_llm()
+            system_prompt = (
+                "You are an expert software architect. Group the following list of repository files "
+                "into logical modules or components. Return ONLY a valid JSON object where the keys "
+                "are module names (e.g. 'Authentication Module') and the values are objects with two keys:\n"
+                "  - 'description': a short 1-2 sentence description of what the module does.\n"
+                "  - 'files': a list of file paths belonging to that module.\n"
+                "Do not include markdown formatting."
+            )
+            # Send max 2000 files to avoid context limits
+            user_prompt = "Files:\n" + "\n".join(file_paths[:2000])
+            
+            resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+            cleaned = clean_llm_response_content(resp)
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```")[1].split("```")[0].strip()
+                
+            repo_map = json.loads(cleaned)
+            
+            # Save to repository document
+            await self.repos_col.update_one(
+                {"_id": ObjectId(self.repository_id)},
+                {"$set": {"repository_map": repo_map}}
+            )
+            
+            # Clear old module vectors
+            await delete_repository_modules(self.repository_id)
+            
+            # Upsert new module vectors
+            for i, (module_name, data) in enumerate(repo_map.items()):
+                description = data.get("description", "")
+                files = data.get("files", [])
+                module_id = f"{self.repository_id}_mod_{i}"
+                await upsert_module_vector(
+                    module_id=module_id,
+                    repository_id=self.repository_id,
+                    module_name=module_name,
+                    description=description,
+                    files=files,
+                )
+            
+            if log_callback:
+                await log_callback("System", "completion", "Repository Map generated and vectorized successfully.")
+                
+        except Exception as e:
+            logger.error(f"Repository map generation failed: {e}")
+            if log_callback:
+                await log_callback("System", "warning", "Repository Map generation failed.")
 
     async def _execute_incremental_sync(
         self,
@@ -280,8 +355,9 @@ class SyncEngine:
                         "content": content,
                         "last_updated": datetime.utcnow(),
                     })
-                    await upsert_file_vector(
-                        str(result.inserted_id), self.repository_id, filename, content[:500]
+                    chunks = chunk_text(content)
+                    await upsert_file_chunks(
+                        str(result.inserted_id), self.repository_id, filename, chunks
                     )
                     tree_dict[filename] = {"path": filename, "type": "blob", "size": len(content)}
                     altered_paths.append(filename)
@@ -310,8 +386,9 @@ class SyncEngine:
                         })
                         file_id = str(result.inserted_id)
 
-                    await upsert_file_vector(
-                        file_id, self.repository_id, filename, content[:500]
+                    chunks = chunk_text(content)
+                    await upsert_file_chunks(
+                        file_id, self.repository_id, filename, chunks
                     )
                     tree_dict[filename] = {"path": filename, "type": "blob", "size": len(content)}
                     altered_paths.append(filename)

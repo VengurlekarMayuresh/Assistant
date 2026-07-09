@@ -19,6 +19,7 @@ from app.config import settings
 from app.db.mongo import init_db, close_db, get_collection
 from app.db.qdrant_client import init_qdrant_collections
 from app.db.neo4j_client import init_neo4j_driver, close_neo4j_driver
+from app.db.redis_client import init_redis, close_redis
 
 from app.schemas import (
     RepositoryCreate, RepositoryOut,
@@ -55,7 +56,8 @@ async def startup_event():
     await init_db()
     await init_qdrant_collections()
     await init_neo4j_driver()
-    logger.info("All database connections initialized: MongoDB ✓  Qdrant ✓  Neo4j ✓")
+    await init_redis()
+    logger.info("All database connections initialized: MongoDB ✓  Qdrant ✓  Neo4j ✓  Redis ✓")
     # Purge orphan Qdrant vectors / Neo4j nodes for TTL-expired repos
     try:
         await run_startup_cleanup()
@@ -68,6 +70,7 @@ async def shutdown_event():
     """Gracefully close all database connections."""
     await close_db()
     await close_neo4j_driver()
+    await close_redis()
     logger.info("All database connections closed.")
 
 
@@ -477,22 +480,32 @@ async def chat_websocket(websocket: WebSocket, session_id: str):
                     "token": token,
                 })
 
-            # Build initial state
+            # Load recent conversation history to pass into the graph
+            # We fetch the last 6 turns (3 user + 3 assistant) for the sliding window
+            raw_history = await messages_col.find(
+                {"session_id": session_id}
+            ).sort("created_at", -1).limit(6).to_list(length=6)
+            chat_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in reversed(raw_history)
+            ]
+
+            # Build initial state — aligned with new Two-Stage AgentState schema
             initial_state = {
                 "query": user_query,
+                "rewritten_query": "",
                 "owner": owner,
                 "repo": repo_name,
                 "branch": "main",
+                "repo_id": repo_id,
                 "file_list": file_list,
                 "languages": languages,
                 "frameworks": frameworks,
-                "plan": [],
-                "step_findings": [],
-                "current_step_index": 0,
-                "files_cache": {},
+                "retrieved_context": [],
+                "chat_history": chat_history,
+                "fallback_count": 0,
                 "session_id": session_id,
                 "final_answer": "",
-                "repo_id": repo_id,
             }
 
             graph = build_agent_graph()
