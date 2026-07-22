@@ -34,7 +34,7 @@ class GitHubService:
         Fetches repository metadata, languages, and detects frameworks.
         """
         url = f"https://api.github.com/repos/{owner}/{repo}"
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(url, headers=self.headers)
             if resp.status_code != 200:
                 raise Exception(f"Failed to fetch repository details: {resp.text}")
@@ -66,7 +66,7 @@ class GitHubService:
         Uses Git Trees API to get all items in a single call.
         """
         url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(url, headers=self.headers)
             
             # If default branch wasn't correct, try fallback
@@ -87,7 +87,7 @@ class GitHubService:
         """
         # Try raw user content first (faster and handles large files cleaner without API rate limits)
         raw_url = f"https://raw.githubusercontent.com/{owner}/{bytes(repo.encode('utf-8')).decode('utf-8')}/{branch}/{path}"
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(raw_url)
             if resp.status_code == 200:
                 return resp.text
@@ -153,7 +153,7 @@ class GitHubService:
     async def fetch_commits(self, owner: str, repo: str, per_page: int = 100) -> List[Dict[str, Any]]:
         """Fetch recent commits from the repository."""
         url = f"https://api.github.com/repos/{owner}/{repo}/commits"
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(url, headers=self.headers, params={"per_page": per_page})
             if resp.status_code == 200:
                 return resp.json()
@@ -162,7 +162,7 @@ class GitHubService:
     async def fetch_pull_requests(self, owner: str, repo: str, state: str = "all", per_page: int = 100) -> List[Dict[str, Any]]:
         """Fetch recent pull requests from the repository."""
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(url, headers=self.headers, params={"state": state, "per_page": per_page})
             if resp.status_code == 200:
                 return resp.json()

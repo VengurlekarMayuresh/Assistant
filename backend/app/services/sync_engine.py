@@ -55,7 +55,7 @@ class SyncEngine:
         """
         try:
             url = f"https://api.github.com/repos/{repo['owner']}/{repo['name']}"
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 resp = await client.get(url, headers=self.gh.headers)
                 if resp.status_code != 200:
                     raise Exception(f"Metadata fetch failed: {resp.text}")
@@ -77,7 +77,7 @@ class SyncEngine:
                 return is_up_to_date, latest_sha
 
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error(f"Health check failed: {repr(e)}")
             return False, ""
 
     async def run_sync(self, log_callback: Optional[Any] = None) -> dict:
@@ -203,12 +203,7 @@ class SyncEngine:
             await log_callback("System", "info", "Generating Knowledge Objects...")
         await ke.generate_knowledge_objects(latest_sha, log_callback)
 
-        # 8. Build Neo4j file dependency graph
-        from app.services.graph_engine import GraphEngine
-        ge = GraphEngine(self.repository_id)
-        if log_callback:
-            await log_callback("System", "info", "Building file dependency graph in Neo4j...")
-        await ge.build_full_graph(log_callback)
+
 
         # 9. Generate and store Repository Map
         if log_callback:
@@ -218,11 +213,11 @@ class SyncEngine:
     async def _generate_repository_map(self, file_paths: List[str], log_callback: Optional[Any] = None):
         """Use LLM to categorize files into a structured Repository Map JSON."""
         try:
-            from app.agents.agent_graph import get_llm, clean_llm_response_content
+            from app.agents.agent_graph import _get_llm, _clean
             from langchain_core.messages import SystemMessage, HumanMessage
             import json
             
-            llm = get_llm()
+            llm = _get_llm()
             system_prompt = (
                 "You are an expert software architect. Group the following list of repository files "
                 "into logical modules or components. Return ONLY a valid JSON object where the keys "
@@ -235,7 +230,7 @@ class SyncEngine:
             user_prompt = "Files:\n" + "\n".join(file_paths[:2000])
             
             resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-            cleaned = clean_llm_response_content(resp)
+            cleaned = _clean(resp)
             if "```json" in cleaned:
                 cleaned = cleaned.split("```json")[1].split("```")[0].strip()
             elif "```" in cleaned:
@@ -286,7 +281,7 @@ class SyncEngine:
             f"/compare/{repo['last_commit_sha']}...{latest_sha}"
         )
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(compare_url, headers=self.gh.headers)
             if resp.status_code != 200:
                 raise Exception(f"Compare API failed: {resp.text}")
@@ -409,7 +404,3 @@ class SyncEngine:
                 await log_callback("System", "info", "Invalidating affected Knowledge Object cache...")
             await ke.invalidate_cache(altered_paths + deleted_paths, latest_sha, log_callback)
 
-        # Update Neo4j graph
-        from app.services.graph_engine import GraphEngine
-        ge = GraphEngine(self.repository_id)
-        await ge.update_files(altered_paths, deleted_paths, log_callback)

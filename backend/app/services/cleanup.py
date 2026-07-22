@@ -11,7 +11,6 @@ from typing import Set
 
 from app.db.mongo import get_collection
 from app.db.qdrant_client import get_qdrant_client, COLLECTION_KNOWLEDGE, COLLECTION_FILES
-from app.db.neo4j_client import delete_repo_graph, get_neo4j_driver
 
 logger = logging.getLogger(__name__)
 
@@ -68,33 +67,10 @@ async def _cleanup_qdrant(live_repo_ids: Set[str]):
         logger.warning(f"[Cleanup] Qdrant cleanup failed (non-fatal): {e}")
 
 
-async def _cleanup_neo4j(live_repo_ids: Set[str]):
-    """Delete Neo4j File nodes whose repo_id no longer exists in MongoDB."""
-    try:
-        driver = get_neo4j_driver()
-        async with driver.session() as session:
-            # Get all distinct repo_ids in Neo4j
-            result = await session.run(
-                "MATCH (f:File) RETURN DISTINCT f.repo_id AS repo_id"
-            )
-            records = await result.data()
-
-            orphan_repo_ids = [
-                rec["repo_id"] for rec in records
-                if rec["repo_id"] and rec["repo_id"] not in live_repo_ids
-            ]
-
-        for repo_id in orphan_repo_ids:
-            await delete_repo_graph(repo_id)
-            logger.info(f"[Cleanup] Deleted Neo4j graph for orphan repo {repo_id}.")
-
-    except Exception as e:
-        logger.warning(f"[Cleanup] Neo4j cleanup failed (non-fatal): {e}")
-
 
 async def run_startup_cleanup():
     """
-    Run once on server startup. Removes Qdrant vectors and Neo4j nodes
+    Run once on server startup. Removes Qdrant vectors
     for repositories that have been auto-deleted by MongoDB TTL.
     """
     logger.info("[Cleanup] Running startup cleanup for orphan data...")
@@ -102,6 +78,5 @@ async def run_startup_cleanup():
     logger.info(f"[Cleanup] Found {len(live_repo_ids)} live repositories in MongoDB.")
 
     await _cleanup_qdrant(live_repo_ids)
-    await _cleanup_neo4j(live_repo_ids)
 
     logger.info("[Cleanup] Startup cleanup complete.")

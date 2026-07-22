@@ -1,5 +1,5 @@
 from typing import Dict, Any, List
-from app.agents.agent_graph import get_llm
+from app.agents.agent_graph import _get_llm, _clean
 from langchain_core.messages import SystemMessage, HumanMessage
 import logging
 import json
@@ -11,7 +11,7 @@ async def generate_mermaid_architecture(repo: Dict[str, Any], file_list: List[st
     Analyzes the repository's files and frameworks to generate a Mermaid 
     architecture diagram, simulating GitDiagram's functionality.
     """
-    llm = get_llm()
+    llm = _get_llm()
     
     # We constrain the LLM to output highly styled, professional Mermaid code
     system_prompt = (
@@ -61,17 +61,12 @@ async def generate_mermaid_architecture(repo: Dict[str, Any], file_list: List[st
     )
     
     try:
-        resp = await llm.ainvoke([
+        messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)
-        ])
-        raw_content = resp.content
-        if isinstance(raw_content, list):
-            content = "".join([c.get("text", "") for c in raw_content if isinstance(c, dict)])
-        else:
-            content = str(raw_content)
-            
-        content = content.strip()
+        ]
+        resp = await llm.ainvoke(messages)
+        content = _clean(resp)
         
         # Extract the mermaid code block if present
         if "```mermaid" in content:

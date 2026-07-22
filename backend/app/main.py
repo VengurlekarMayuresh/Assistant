@@ -18,7 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db.mongo import init_db, close_db, get_collection
 from app.db.qdrant_client import init_qdrant_collections
-from app.db.neo4j_client import init_neo4j_driver, close_neo4j_driver
 from app.db.redis_client import init_redis, close_redis
 
 from app.schemas import (
@@ -54,10 +53,12 @@ app.add_middleware(
 async def startup_event():
     """Initialize all three database connections + run cleanup on startup."""
     await init_db()
-    await init_qdrant_collections()
-    await init_neo4j_driver()
+    try:
+        await init_qdrant_collections()
+    except Exception as e:
+        logger.error(f"Failed to initialize Qdrant. The vector database is down or unreachable: {e}")
     await init_redis()
-    logger.info("All database connections initialized: MongoDB ✓  Qdrant ✓  Neo4j ✓  Redis ✓")
+    logger.info("All database connections initialized: MongoDB ✓  Qdrant ✓  Redis ✓")
     # Purge orphan Qdrant vectors / Neo4j nodes for TTL-expired repos
     try:
         await run_startup_cleanup()
@@ -69,7 +70,6 @@ async def startup_event():
 async def shutdown_event():
     """Gracefully close all database connections."""
     await close_db()
-    await close_neo4j_driver()
     await close_redis()
     logger.info("All database connections closed.")
 
@@ -229,24 +229,6 @@ async def get_repository_file(repo_id: str, path: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to load file: {str(e)}",
         )
-
-
-@app.get("/api/repositories/{repo_id}/graph")
-async def get_file_dependencies(repo_id: str, path: str, depth: int = 2):
-    """Return the Neo4j import dependency graph for a given file."""
-    from app.db.neo4j_client import get_file_dependencies, get_file_dependents
-    try:
-        deps = await get_file_dependencies(repo_id, path, depth)
-        dependents = await get_file_dependents(repo_id, path, depth)
-    except Exception as error:
-        logger.warning(f"Neo4j graph lookup failed for {path}: {error}")
-        deps = []
-        dependents = []
-    return {
-        "path": path,
-        "imports": deps,       # files this file imports
-        "imported_by": dependents,  # files that import this file
-    }
 
 
 @app.get("/api/repositories/{repo_id}/commits")

@@ -136,7 +136,7 @@ def prune_structure(tree_items: List[Dict], max_files: Optional[int] = 5000) -> 
 
 # ── Node 1: Query Rewriter ─────────────────────────────────────────────────
 
-async def query_rewriter_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+async def query_rewriter_node(state: AgentState, config: RunnableConfig = None) -> Dict[str, Any]:
     """
     Expands the raw user query into a richer semantic search string,
     using the conversation history to resolve pronouns and infer intent.
@@ -167,7 +167,7 @@ async def query_rewriter_node(state: AgentState, config: Any = None) -> Dict[str
 
 # ── Node 2: Retriever ─────────────────────────────────────────────────────
 
-async def retriever_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+async def retriever_node(state: AgentState, config: RunnableConfig = None) -> Dict[str, Any]:
     """
     Retrieves files for the synthesizer. Two operating modes:
 
@@ -230,7 +230,7 @@ async def retriever_node(state: AgentState, config: Any = None) -> Dict[str, Any
 
 # ── Node 3: Synthesizer ────────────────────────────────────────────────────
 
-async def synthesizer_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+async def synthesizer_node(state: AgentState, config: RunnableConfig = None) -> Dict[str, Any]:
     """
     Generates the final answer using a strict prompt-cache-optimal layout:
 
@@ -331,7 +331,7 @@ async def synthesizer_node(state: AgentState, config: Any = None) -> Dict[str, A
 
 # ── Node 4: Research Node ──────────────────────────────────────────────────
 
-async def research_node(state: AgentState, config: Any = None) -> Dict[str, Any]:
+async def research_node(state: AgentState, config: RunnableConfig = None) -> Dict[str, Any]:
     """
     Agentic research step triggered when the Synthesizer signals missing context.
 

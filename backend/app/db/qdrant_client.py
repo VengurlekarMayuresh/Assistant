@@ -101,7 +101,12 @@ async def init_qdrant_collections():
             collection_name=COLLECTION_KNOWLEDGE,
             vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
         )
-        logger.info(f"Qdrant collection '{COLLECTION_KNOWLEDGE}' created.")
+        await _qdrant_client.create_payload_index(
+            collection_name=COLLECTION_KNOWLEDGE,
+            field_name="repository_id",
+            field_schema="keyword",
+        )
+        logger.info(f"Qdrant collection '{COLLECTION_KNOWLEDGE}' created with index.")
     else:
         logger.info(f"Qdrant collection '{COLLECTION_KNOWLEDGE}' already exists.")
 
@@ -111,7 +116,12 @@ async def init_qdrant_collections():
             collection_name=COLLECTION_FILES,
             vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
         )
-        logger.info(f"Qdrant collection '{COLLECTION_FILES}' created.")
+        await _qdrant_client.create_payload_index(
+            collection_name=COLLECTION_FILES,
+            field_name="repository_id",
+            field_schema="keyword",
+        )
+        logger.info(f"Qdrant collection '{COLLECTION_FILES}' created with index.")
     else:
         logger.info(f"Qdrant collection '{COLLECTION_FILES}' already exists.")
 
@@ -121,7 +131,12 @@ async def init_qdrant_collections():
             collection_name=COLLECTION_MODULES,
             vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
         )
-        logger.info(f"Qdrant collection '{COLLECTION_MODULES}' created.")
+        await _qdrant_client.create_payload_index(
+            collection_name=COLLECTION_MODULES,
+            field_name="repository_id",
+            field_schema="keyword",
+        )
+        logger.info(f"Qdrant collection '{COLLECTION_MODULES}' created with index.")
     else:
         logger.info(f"Qdrant collection '{COLLECTION_MODULES}' already exists.")
 

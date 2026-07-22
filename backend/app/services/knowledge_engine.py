@@ -17,7 +17,7 @@ from bson import ObjectId
 
 from app.db.mongo import get_collection
 from app.db.qdrant_client import upsert_knowledge_object_vector
-from app.agents.agent_graph import get_llm, clean_llm_response_content
+from app.agents.agent_graph import _get_llm, _clean
 from langchain_core.messages import SystemMessage, HumanMessage
 
 logger = logging.getLogger(__name__)
@@ -203,7 +203,7 @@ class KnowledgeEngine:
         files: List[dict],
     ) -> Tuple[str, float]:
         """Invoke Google GenAI LLM to write a markdown architectural summary."""
-        llm = get_llm()
+        llm = _get_llm()
 
         file_contexts = []
         for file_doc in files[:15]:
@@ -226,11 +226,8 @@ class KnowledgeEngine:
         )
 
         try:
-            resp = await llm.ainvoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt),
-            ])
-            content_text = clean_llm_response_content(resp)
+            resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+            content_text = _clean(resp)
 
             confidence = 0.90
             conf_match = re.search(r"--- CONFIDENCE:\s*([\d.]+)\s*---", content_text)
