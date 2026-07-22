@@ -196,12 +196,7 @@ class SyncEngine:
             except Exception as e:
                 logger.error(f"Error caching {file_path}: {e}")
 
-        # 7. Generate Knowledge Objects (MongoDB + Qdrant)
-        from app.services.knowledge_engine import KnowledgeEngine
-        ke = KnowledgeEngine(self.repository_id)
-        if log_callback:
-            await log_callback("System", "info", "Generating Knowledge Objects...")
-        await ke.generate_knowledge_objects(latest_sha, log_callback)
+        # (Knowledge Objects generation removed as per user request to simplify)
 
 
 
