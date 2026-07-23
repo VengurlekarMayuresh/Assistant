@@ -205,64 +205,6 @@ class SyncEngine:
             await log_callback("System", "info", "Generating structured Repository Map...")
         await self._generate_repository_map(key_files, log_callback)
 
-    async def _generate_repository_map(self, file_paths: List[str], log_callback: Optional[Any] = None):
-        """Use LLM to categorize files into a structured Repository Map JSON."""
-        try:
-            from app.agents.agent_graph import _get_llm, _clean
-            from langchain_core.messages import SystemMessage, HumanMessage
-            import json
-            
-            llm = _get_llm()
-            system_prompt = (
-                "You are an expert software architect. Group the following list of repository files "
-                "into logical modules or components. Return ONLY a valid JSON object where the keys "
-                "are module names (e.g. 'Authentication Module') and the values are objects with two keys:\n"
-                "  - 'description': a short 1-2 sentence description of what the module does.\n"
-                "  - 'files': a list of file paths belonging to that module.\n"
-                "Do not include markdown formatting."
-            )
-            # Send max 2000 files to avoid context limits
-            user_prompt = "Files:\n" + "\n".join(file_paths[:2000])
-            
-            resp = await llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-            cleaned = _clean(resp)
-            if "```json" in cleaned:
-                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-            elif "```" in cleaned:
-                cleaned = cleaned.split("```")[1].split("```")[0].strip()
-                
-            repo_map = json.loads(cleaned)
-            
-            # Save to repository document
-            await self.repos_col.update_one(
-                {"_id": ObjectId(self.repository_id)},
-                {"$set": {"repository_map": repo_map}}
-            )
-            
-            # Clear old module vectors
-            await delete_repository_modules(self.repository_id)
-            
-            # Upsert new module vectors
-            for i, (module_name, data) in enumerate(repo_map.items()):
-                description = data.get("description", "")
-                files = data.get("files", [])
-                module_id = f"{self.repository_id}_mod_{i}"
-                await upsert_module_vector(
-                    module_id=module_id,
-                    repository_id=self.repository_id,
-                    module_name=module_name,
-                    description=description,
-                    files=files,
-                )
-            
-            if log_callback:
-                await log_callback("System", "completion", "Repository Map generated and vectorized successfully.")
-                
-        except Exception as e:
-            logger.error(f"Repository map generation failed: {e}")
-            if log_callback:
-                await log_callback("System", "warning", "Repository Map generation failed.")
-
     async def _execute_incremental_sync(
         self,
         repo: dict,
